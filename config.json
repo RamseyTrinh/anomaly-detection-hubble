@@ -1,0 +1,17 @@
+{
+  "hubble_server": "localhost:4245",
+  "flow_filters": [],
+  "check_interval": "5s",
+  "alert_thresholds": {
+    "high_bandwidth_threshold": 100000000,
+    "high_connection_threshold": 1000,
+    "unusual_port_threshold": 50,
+    "drop_rate_threshold": 5.0,
+    "time_window": "60s",
+    "unusual_destination_threshold": 100,
+    "namespace_bandwidth_threshold": 50000000,
+    "namespace_connection_threshold": 500,
+    "cross_namespace_threshold": 50
+  },
+  "log_level": "info"
+}
