@@ -8,164 +8,94 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
-
-	"github.com/sirupsen/logrus"
 )
 
 func main() {
 	// Parse command line flags
 	var (
-		configFile    = flag.String("config", "", "Path to configuration file")
-		hubbleServer  = flag.String("hubble-server", "localhost:4245", "Hubble server address")
-		alertLogFile  = flag.String("alert-log", "alerts.log", "Alert log file path")
-		logLevel      = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
-		useRealClient = flag.Bool("real-client", true, "Use real Hubble client instead of mock")
-		showVersion   = flag.Bool("version", false, "Show version information")
+		hubbleServer   = flag.String("hubble-server", "localhost:4245", "Hubble server address")
+		namespace      = flag.String("namespace", "", "Filter flows by namespace (e.g., 'kube-system', 'default')")
+		listNamespaces = flag.Bool("list-namespaces", false, "List all available namespaces")
+		showVersion    = flag.Bool("version", false, "Show version information")
 	)
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Println("Hubble Anomaly Detector v1.0.0")
+		fmt.Println("Hubble gRPC Client v1.0.0")
 		return
 	}
 
-	// Setup logger
-	logger := setupLogger(*logLevel)
-	logger.Info("Starting Hubble Anomaly Detector")
+	if *listNamespaces {
+		// Create gRPC client
+		client, err := NewHubbleGRPCClient(*hubbleServer)
+		if err != nil {
+			fmt.Printf("❌ Failed to create client: %v\n", err)
+			os.Exit(1)
+		}
+		defer client.Close()
 
-	// Load configuration
-	config := loadConfig(*configFile, *hubbleServer, *useRealClient, logger)
+		// Test connection
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := client.TestConnection(ctx); err != nil {
+			fmt.Printf("❌ Connection test failed: %v\n", err)
+			os.Exit(1)
+		}
 
-	// Create alert handler
-	alertHandler, err := NewAlertHandler(logger, *alertLogFile)
+		// Get namespaces
+		namespaces, err := client.GetNamespaces(ctx)
+		if err != nil {
+			fmt.Printf("❌ Failed to get namespaces: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Println("📋 Available namespaces:")
+		for i, ns := range namespaces {
+			fmt.Printf("  %d. %s\n", i+1, ns)
+		}
+		return
+	}
+
+	fmt.Println("🔍 Hubble gRPC Client")
+	fmt.Printf("Connecting to Hubble relay at: %s\n", *hubbleServer)
+	fmt.Println("")
+
+	// Create gRPC client
+	client, err := NewHubbleGRPCClient(*hubbleServer)
 	if err != nil {
-		logger.WithError(err).Fatal("Failed to create alert handler")
+		fmt.Printf("❌ Failed to create client: %v\n", err)
+		os.Exit(1)
 	}
-	defer alertHandler.Close()
+	defer client.Close()
 
-	// Create anomaly detector
-	detector := NewAnomalyDetector(config, logger)
-
-	// Create Hubble client
-	var hubbleClient interface {
-		Close() error
-		GetServerStatus(ctx context.Context) error
-		StartFlowStreaming(ctx context.Context, detector *AnomalyDetector, flowFilters []string) error
-	}
-
-	if config.UseRealClient {
-		hubbleClient, err = NewHubbleSimpleClient(config.HubbleServer, logger)
-		if err != nil {
-			logger.WithError(err).Fatal("Failed to create simple gRPC Hubble client")
-		}
-	} else {
-		hubbleClient, err = NewHubbleClient(config.HubbleServer, logger)
-		if err != nil {
-			logger.WithError(err).Fatal("Failed to create mock Hubble client")
-		}
-	}
-	defer hubbleClient.Close()
-
-	// Test Hubble server connection
-	logger.Info("Testing Hubble server connection...")
+	// Test connection
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	if err := hubbleClient.GetServerStatus(ctx); err != nil {
-		logger.WithError(err).Fatal("Failed to connect to Hubble server")
+	if err := client.TestConnection(ctx); err != nil {
+		fmt.Printf("❌ Connection test failed: %v\n", err)
+		os.Exit(1)
 	}
 	cancel()
-	logger.Info("Successfully connected to Hubble server")
 
 	// Setup signal handling
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Start alert handler goroutine
-	go func() {
-		for alert := range detector.GetAlertChannel() {
-			alertHandler.HandleAlert(alert)
-		}
-	}()
-
-	// Start statistics reset goroutine
-	go func() {
-		ticker := time.NewTicker(config.AlertThresholds.TimeWindow)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				detector.ResetStats()
-				logger.Info("Flow statistics reset")
-			}
-		}
-	}()
-
-	// Start flow streaming
-	logger.Info("Starting flow streaming...")
+	// Start streaming flows
 	ctx, cancel = context.WithCancel(context.Background())
 	defer cancel()
 
 	// Handle shutdown signals
 	go func() {
 		<-sigChan
-		logger.Info("Received shutdown signal, stopping...")
+		fmt.Println("\n🛑 Received shutdown signal, stopping...")
 		cancel()
 	}()
 
-	// Start streaming flows
-	err = hubbleClient.StartFlowStreaming(ctx, detector, config.FlowFilters)
-	if err != nil && err != context.Canceled {
-		logger.WithError(err).Error("Flow streaming failed")
+	// Stream flows
+	if err := client.StreamFlows(ctx, *namespace); err != nil {
+		fmt.Printf("❌ Flow streaming failed: %v\n", err)
+		os.Exit(1)
 	}
 
-	// Print summary
-	alertHandler.PrintSummary()
-	logger.Info("Hubble Anomaly Detector stopped")
-}
-
-// setupLogger configures the logger
-func setupLogger(level string) *logrus.Logger {
-	logger := logrus.New()
-	logger.SetFormatter(&logrus.TextFormatter{
-		FullTimestamp:   true,
-		TimestampFormat: "2006-01-02 15:04:05",
-	})
-
-	// Set log level
-	switch level {
-	case "debug":
-		logger.SetLevel(logrus.DebugLevel)
-	case "info":
-		logger.SetLevel(logrus.InfoLevel)
-	case "warn":
-		logger.SetLevel(logrus.WarnLevel)
-	case "error":
-		logger.SetLevel(logrus.ErrorLevel)
-	default:
-		logger.SetLevel(logrus.InfoLevel)
-	}
-
-	return logger
-}
-
-// loadConfig loads configuration from file or uses defaults
-func loadConfig(configFile, hubbleServer string, useRealClient bool, logger *logrus.Logger) *Config {
-	config := DefaultConfig()
-
-	// Override with command line values
-	if hubbleServer != "" {
-		config.HubbleServer = hubbleServer
-	}
-	config.UseRealClient = useRealClient
-
-	// TODO: Add configuration file loading if needed
-	// For now, we'll use the default configuration with command line overrides
-
-	logger.WithFields(logrus.Fields{
-		"hubble_server":   config.HubbleServer,
-		"check_interval":  config.CheckInterval,
-		"log_level":       config.LogLevel,
-		"use_real_client": config.UseRealClient,
-	}).Info("Configuration loaded")
-
-	return config
+	fmt.Println("✅ Hubble gRPC Client stopped")
 }
