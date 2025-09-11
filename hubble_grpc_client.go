@@ -105,8 +105,10 @@ func (c *HubbleGRPCClient) StreamFlows(ctx context.Context, namespace string) er
 	if namespace != "" {
 		req.Whitelist = []*observer.FlowFilter{
 			{
-				SourcePod:      []string{namespace + "/*"},
-				DestinationPod: []string{namespace + "/*"},
+				SourceLabel: []string{"k8s:io.kubernetes.pod.namespace=" + namespace},
+			},
+			{
+				DestinationLabel: []string{"k8s:io.kubernetes.pod.namespace=" + namespace},
 			},
 		}
 	}

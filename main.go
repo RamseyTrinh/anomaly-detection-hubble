@@ -14,7 +14,7 @@ func main() {
 	// Parse command line flags
 	var (
 		hubbleServer   = flag.String("hubble-server", "localhost:4245", "Hubble server address")
-		namespace      = flag.String("namespace", "", "Filter flows by namespace (e.g., 'kube-system', 'default')")
+		namespace      = flag.String("namespace", "default", "Filter flows by namespace (default: 'default')")
 		listNamespaces = flag.Bool("list-namespaces", false, "List all available namespaces")
 		showVersion    = flag.Bool("version", false, "Show version information")
 	)
@@ -58,6 +58,7 @@ func main() {
 
 	fmt.Println("🔍 Hubble gRPC Client")
 	fmt.Printf("Connecting to Hubble relay at: %s\n", *hubbleServer)
+	fmt.Printf("📋 Filtering flows for namespace: %s\n", *namespace)
 	fmt.Println("")
 
 	// Create gRPC client
