@@ -118,9 +118,11 @@ go build -o hubble-anomaly-detector
 .
 ├── main.go                 # Entry point
 ├── config.go              # Configuration structures
-├── hubble_client.go       # Hubble client implementation
+├── hubble_grpc_client.go  # Hubble gRPC client implementation
+├── hubble_real_client.go  # Hubble real client implementation
 ├── anomaly_detector.go    # Anomaly detection logic
 ├── alert_handler.go       # Alert handling and output
+├── flow_types.go          # Flow data structures
 ├── go.mod                 # Go module file
 └── README.md             # Documentation
 ```

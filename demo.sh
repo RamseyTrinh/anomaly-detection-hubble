@@ -1,9 +1,10 @@
 #!/bin/bash
 
-echo "Starting Hubble Anomaly Detector Demo..."
+echo "Starting Hubble Anomaly Detector..."
 echo ""
-echo "This demo will run the anomaly detector in mock mode"
+echo "This will run the anomaly detector with real Hubble relay data"
+echo "Make sure Hubble server is running on localhost:4245"
 echo "Press Ctrl+C to stop"
 echo ""
 
-./hubble-anomaly-detector --log-level=debug --hubble-server=localhost:4245 --alert-log=demo-alerts.log
+./hubble-anomaly-detector --log-level=debug --hubble-server=localhost:4245 --alert-log=alerts.log
