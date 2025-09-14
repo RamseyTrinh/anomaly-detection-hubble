@@ -47,13 +47,13 @@ func (ah *AlertHandler) HandleAlert(alert Alert) {
 	ah.alertCount++
 
 	// Create alert summary
-	summary := fmt.Sprintf("[%s] %s: %s",
-		alert.Severity,
-		alert.Type,
-		alert.Message)
+	// summary := fmt.Sprintf("[%s] %s: %s",
+	// 	alert.Severity,
+	// 	alert.Type,
+	// 	alert.Message)
 
 	// Log to console with color coding
-	ah.logToConsole(alert, summary)
+	// ah.logToConsole(alert, summary)
 
 	// Log to file if configured
 	if ah.alertFile != nil {
@@ -61,13 +61,13 @@ func (ah *AlertHandler) HandleAlert(alert Alert) {
 	}
 
 	// Log structured data
-	ah.logger.WithFields(logrus.Fields{
-		"alert_count": ah.alertCount,
-		"type":        alert.Type,
-		"severity":    alert.Severity,
-		"timestamp":   alert.Timestamp,
-		"message":     alert.Message,
-	}).Warn("Anomaly Alert")
+	// ah.logger.WithFields(logrus.Fields{
+	// 	"alert_count": ah.alertCount,
+	// 	"type":        alert.Type,
+	// 	"severity":    alert.Severity,
+	// 	"timestamp":   alert.Timestamp,
+	// 	"message":     alert.Message,
+	// }).Warn("Anomaly Alert")
 }
 
 // logToConsole logs alert to console with color coding

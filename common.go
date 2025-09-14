@@ -154,6 +154,47 @@ func convertGRPCFlowToFlow(grpcFlow *observer.Flow) *Flow {
 	return flow
 }
 
+// printAnomalyAlert prints anomaly alert in the requested format
+func printAnomalyAlert(alert Alert) {
+	// Set timezone to UTC+7 (Vietnam timezone)
+	loc, _ := time.LoadLocation("Asia/Ho_Chi_Minh")
+	timeInUTC7 := alert.Timestamp.In(loc)
+
+	fmt.Println("=" + strings.Repeat("=", 60))
+	fmt.Printf("Anomaly: DETECTED\n")
+	fmt.Printf("Time: %s\n", timeInUTC7.Format("2006-01-02 15:04:05"))
+	fmt.Printf("Type: %s\n", alert.Type)
+
+	if alert.FlowData != nil {
+		if alert.FlowData.Source != nil {
+			fmt.Printf("Source Pod: %s\n", alert.FlowData.Source.PodName)
+		} else {
+			fmt.Printf("Source Pod: Unknown\n")
+		}
+
+		if alert.FlowData.Destination != nil {
+			fmt.Printf("Destination Pod: %s\n", alert.FlowData.Destination.PodName)
+		} else {
+			fmt.Printf("Destination Pod: Unknown\n")
+		}
+
+		// Add additional details based on anomaly type
+		switch alert.Type {
+		case "TRAFFIC_SPIKE":
+			fmt.Printf("Details: Traffic spike detected\n")
+		case "DDOS_PATTERN":
+			fmt.Printf("Details: DDoS pattern detected\n")
+		case "HIGH_ERROR_RATE":
+			fmt.Printf("Details: High HTTP error rate\n")
+		case "ERROR_BURST":
+			fmt.Printf("Details: Error burst detected\n")
+		}
+	}
+
+	fmt.Printf("Severity: %s\n", alert.Severity)
+	fmt.Println("=" + strings.Repeat("=", 60))
+}
+
 // detectAnomaly handles the anomaly detection functionality
 func detectAnomaly(client *HubbleGRPCClient, namespace string) {
 	fmt.Println("\n🚨 ANOMALY DETECTION")
@@ -259,6 +300,9 @@ func startAnomalyDetection(ctx context.Context, client *HubbleGRPCClient, detect
 			case <-ctx.Done():
 				return
 			case alert := <-detector.GetAlertChannel():
+				// Print anomaly in the requested format
+				printAnomalyAlert(alert)
+				// Also handle alert (save to file)
 				alertHandler.HandleAlert(alert)
 			}
 		}
@@ -280,13 +324,13 @@ func startAnomalyDetection(ctx context.Context, client *HubbleGRPCClient, detect
 			// Convert gRPC flow to our Flow struct
 			flow := convertGRPCFlowToFlow(response.GetFlow())
 			if flow != nil {
-				// Process flow with anomaly detector
+				// Process flow with anomaly detector (silent processing)
 				detector.ProcessFlow(ctx, flow)
 			}
 
-			// Print progress every 100 flows
-			if flowCount%100 == 0 {
-				fmt.Printf("📊 Processed %d flows...\n", flowCount)
+			// Only print progress every 1000 flows (less verbose)
+			if flowCount%1000 == 0 {
+				fmt.Printf("📊 Monitoring... Processed %d flows (silent mode)\n", flowCount)
 			}
 		}
 	}

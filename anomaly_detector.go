@@ -11,17 +11,44 @@ import (
 
 // AnomalyDetector handles anomaly detection logic
 type AnomalyDetector struct {
-	config           *Config
-	logger           *logrus.Logger
-	flowStats        *FlowStats
-	alertChannel     chan Alert
-	mu               sync.RWMutex
-	knownPorts       map[uint32]bool
-	knownDests       map[string]bool
-	unusualPorts     map[uint32]int
-	unusualDests     map[string]int
-	namespaceStats   map[string]*NamespaceStats
-	unusualNamespace map[string]int
+	config       *Config
+	logger       *logrus.Logger
+	flowStats    *FlowStats
+	alertChannel chan Alert
+	mu           sync.RWMutex
+
+	// Traffic Spike Detection
+	trafficBaseline map[string]float64         // pod-pair -> baseline bytes/min
+	trafficHistory  map[string][]TrafficSample // pod-pair -> recent samples
+
+	// DDoS Pattern Detection
+	connectionCounts map[string]int       // source-dest -> connection count
+	connectionWindow map[string]time.Time // source-dest -> window start time
+
+	// High Error Rate Detection
+	httpStats map[string]*HTTPStats // endpoint -> HTTP statistics
+
+	// Error Burst Detection
+	errorBurstHistory map[string][]ErrorSample // endpoint -> recent error samples
+}
+
+// ErrorSample represents an error measurement
+type ErrorSample struct {
+	Timestamp time.Time
+	IsError   bool
+}
+
+// TrafficSample represents a traffic measurement
+type TrafficSample struct {
+	Timestamp time.Time
+	Bytes     uint64
+}
+
+// HTTPStats holds HTTP request statistics
+type HTTPStats struct {
+	TotalRequests int64
+	ErrorRequests int64
+	LastReset     time.Time
 }
 
 // NamespaceStats holds statistics for a specific namespace
@@ -64,16 +91,18 @@ type Alert struct {
 // NewAnomalyDetector creates a new anomaly detector
 func NewAnomalyDetector(config *Config, logger *logrus.Logger) *AnomalyDetector {
 	return &AnomalyDetector{
-		config:           config,
-		logger:           logger,
-		flowStats:        &FlowStats{LastReset: time.Now()},
-		alertChannel:     make(chan Alert, 100),
-		knownPorts:       make(map[uint32]bool),
-		knownDests:       make(map[string]bool),
-		unusualPorts:     make(map[uint32]int),
-		unusualDests:     make(map[string]int),
-		namespaceStats:   make(map[string]*NamespaceStats),
-		unusualNamespace: make(map[string]int),
+		config:       config,
+		logger:       logger,
+		flowStats:    &FlowStats{LastReset: time.Now()},
+		alertChannel: make(chan Alert, 100),
+
+		// Initialize new detection maps
+		trafficBaseline:   make(map[string]float64),
+		trafficHistory:    make(map[string][]TrafficSample),
+		connectionCounts:  make(map[string]int),
+		connectionWindow:  make(map[string]time.Time),
+		httpStats:         make(map[string]*HTTPStats),
+		errorBurstHistory: make(map[string][]ErrorSample),
 	}
 }
 
@@ -85,13 +114,11 @@ func (ad *AnomalyDetector) ProcessFlow(ctx context.Context, f *Flow) {
 	// Update statistics
 	ad.updateStats(f)
 
-	// Check for various anomalies
-	ad.checkHighBandwidth(f)
-	ad.checkUnusualPorts(f)
-	ad.checkUnusualDestinations(f)
-	ad.checkDroppedPackets(f)
-	ad.checkHighConnectionRate(f)
-	ad.checkNamespaceAnomalies(f)
+	// Check for anomalies based on 4 rules
+	ad.checkTrafficSpike(f)
+	ad.checkDDoSPattern(f)
+	ad.checkHighErrorRate(f)
+	ad.checkErrorBurst(f)
 }
 
 // updateStats updates flow statistics
@@ -121,9 +148,6 @@ func (ad *AnomalyDetector) updateStats(f *Flow) {
 		ad.flowStats.ConnectionRate = float64(ad.flowStats.TotalConnections) / timeDiff
 		ad.flowStats.DropRate = (float64(ad.flowStats.DroppedPackets) / float64(ad.flowStats.TotalFlows)) * 100
 	}
-
-	// Update namespace statistics
-	ad.updateNamespaceStats(f, bytes)
 }
 
 // calculateBytes estimates bytes from flow data
@@ -140,158 +164,230 @@ func (ad *AnomalyDetector) calculateBytes(f *Flow) int64 {
 	return 0
 }
 
-// checkHighBandwidth checks for unusually high bandwidth usage
-func (ad *AnomalyDetector) checkHighBandwidth(f *Flow) {
-	if ad.flowStats.ByteRate > float64(ad.config.AlertThresholds.HighBandwidthThreshold) {
+// checkTrafficSpike checks for traffic spike anomalies (Rule 1)
+func (ad *AnomalyDetector) checkTrafficSpike(f *Flow) {
+	if f.Source == nil || f.Destination == nil || f.IP == nil {
+		return
+	}
+
+	// Create pod-pair key
+	podPair := fmt.Sprintf("%s-%s", f.Source.PodName, f.Destination.PodName)
+
+	// Calculate bytes for this flow
+	bytes := ad.calculateBytes(f)
+	if bytes == 0 {
+		return
+	}
+
+	// Add sample to history
+	now := time.Now()
+	sample := TrafficSample{
+		Timestamp: now,
+		Bytes:     uint64(bytes),
+	}
+
+	ad.trafficHistory[podPair] = append(ad.trafficHistory[podPair], sample)
+
+	// Keep only last 5 minutes of data
+	fiveMinutesAgo := now.Add(-5 * time.Minute)
+	var recentSamples []TrafficSample
+	for _, s := range ad.trafficHistory[podPair] {
+		if s.Timestamp.After(fiveMinutesAgo) {
+			recentSamples = append(recentSamples, s)
+		}
+	}
+	ad.trafficHistory[podPair] = recentSamples
+
+	// Calculate baseline (average of last 5 minutes)
+	if len(ad.trafficHistory[podPair]) < 2 {
+		return
+	}
+
+	var totalBytes float64
+	for _, s := range ad.trafficHistory[podPair] {
+		totalBytes += float64(s.Bytes)
+	}
+	baseline := totalBytes / float64(len(ad.trafficHistory[podPair]))
+	ad.trafficBaseline[podPair] = baseline
+
+	// Check for traffic spike: > 200% of baseline
+	if float64(bytes) > 2.0*baseline {
 		alert := Alert{
-			Type:     "HIGH_BANDWIDTH",
+			Type:     "TRAFFIC_SPIKE",
 			Severity: "HIGH",
-			Message: fmt.Sprintf("High bandwidth detected: %.2f bytes/s (threshold: %d)",
-				ad.flowStats.ByteRate, ad.config.AlertThresholds.HighBandwidthThreshold),
-			Timestamp: time.Now(),
+			Message: fmt.Sprintf("Traffic spike detected: Pod %s -> %s: %.2f bytes (baseline: %.2f, increase: %.1f%%)",
+				f.Source.PodName, f.Destination.PodName, float64(bytes), baseline, (float64(bytes)/baseline)*100),
+			Timestamp: now,
 			FlowData:  f,
-			Stats:     ad.flowStats,
 		}
 		ad.sendAlert(alert)
 	}
 }
 
-// checkUnusualPorts checks for connections to unusual ports
-func (ad *AnomalyDetector) checkUnusualPorts(f *Flow) {
-	if f.L4 != nil {
-		var port uint32
-		if f.L4.TCP != nil {
-			port = f.L4.TCP.DestinationPort
-		} else if f.L4.UDP != nil {
-			port = f.L4.UDP.DestinationPort
-		}
+// checkDDoSPattern checks for DDoS pattern anomalies (Rule 2)
+func (ad *AnomalyDetector) checkDDoSPattern(f *Flow) {
+	if f.IP == nil || f.L4 == nil {
+		return
+	}
 
-		if port > 0 {
-			// Check if it's a known port (common services)
-			if !ad.isKnownPort(port) {
-				ad.unusualPorts[port]++
-				if ad.unusualPorts[port] > ad.config.AlertThresholds.UnusualPortThreshold {
-					alert := Alert{
-						Type:     "UNUSUAL_PORT",
-						Severity: "MEDIUM",
-						Message: fmt.Sprintf("Unusual port activity detected: port %d (%d connections)",
-							port, ad.unusualPorts[port]),
-						Timestamp: time.Now(),
-						FlowData:  f,
-					}
-					ad.sendAlert(alert)
-				}
+	// Create source-destination key
+	sourceDest := fmt.Sprintf("%s-%s", f.IP.Source, f.IP.Destination)
+	now := time.Now()
+
+	// Check if we need to reset the window (10 seconds)
+	if windowStart, exists := ad.connectionWindow[sourceDest]; exists {
+		if now.Sub(windowStart) > 10*time.Second {
+			// Reset window
+			ad.connectionCounts[sourceDest] = 0
+			ad.connectionWindow[sourceDest] = now
+		}
+	} else {
+		// Initialize window
+		ad.connectionWindow[sourceDest] = now
+		ad.connectionCounts[sourceDest] = 0
+	}
+
+	// Increment connection count
+	ad.connectionCounts[sourceDest]++
+
+	// Check for DDoS pattern: > 100 connections in 10 seconds
+	if ad.connectionCounts[sourceDest] > 100 {
+		alert := Alert{
+			Type:     "DDOS_PATTERN",
+			Severity: "HIGH",
+			Message: fmt.Sprintf("DDoS pattern detected: %s -> %s: %d connections in 10 seconds",
+				f.IP.Source, f.IP.Destination, ad.connectionCounts[sourceDest]),
+			Timestamp: now,
+			FlowData:  f,
+		}
+		ad.sendAlert(alert)
+	}
+}
+
+// checkHighErrorRate checks for high HTTP error rate anomalies (Rule 3)
+func (ad *AnomalyDetector) checkHighErrorRate(f *Flow) {
+	// Only check HTTP flows
+	if f.L7 == nil || f.L7.Type != L7Type_HTTP {
+		return
+	}
+
+	if f.Destination == nil {
+		return
+	}
+
+	// Create endpoint key
+	endpoint := fmt.Sprintf("%s:%s", f.Destination.PodName, f.Destination.Namespace)
+	now := time.Now()
+
+	// Initialize HTTP stats if not exists
+	if _, exists := ad.httpStats[endpoint]; !exists {
+		ad.httpStats[endpoint] = &HTTPStats{
+			LastReset: now,
+		}
+	}
+
+	stats := ad.httpStats[endpoint]
+
+	// Reset stats every minute
+	if now.Sub(stats.LastReset) > time.Minute {
+		stats.TotalRequests = 0
+		stats.ErrorRequests = 0
+		stats.LastReset = now
+	}
+
+	// Increment total requests
+	stats.TotalRequests++
+
+	// Check if this is an error (simplified - in real implementation you'd parse HTTP response)
+	// For now, we'll assume dropped packets or certain verdicts indicate errors
+	if f.Verdict == Verdict_DROPPED || f.Verdict == Verdict_ERROR {
+		stats.ErrorRequests++
+	}
+
+	// Calculate error rate
+	if stats.TotalRequests > 0 {
+		errorRate := float64(stats.ErrorRequests) / float64(stats.TotalRequests) * 100
+
+		// Check for high error rate: > 5%
+		if errorRate > 5.0 {
+			alert := Alert{
+				Type:     "HIGH_ERROR_RATE",
+				Severity: "HIGH",
+				Message: fmt.Sprintf("High HTTP error rate detected: %s: %.2f%% (%d/%d requests)",
+					endpoint, errorRate, stats.ErrorRequests, stats.TotalRequests),
+				Timestamp: now,
+				FlowData:  f,
+			}
+			ad.sendAlert(alert)
+		}
+	}
+}
+
+// checkErrorBurst checks for error burst anomalies (Rule 4)
+func (ad *AnomalyDetector) checkErrorBurst(f *Flow) {
+	// Only check HTTP flows
+	if f.L7 == nil || f.L7.Type != L7Type_HTTP {
+		return
+	}
+
+	if f.Destination == nil {
+		return
+	}
+
+	// Create endpoint key
+	endpoint := fmt.Sprintf("%s:%s", f.Destination.PodName, f.Destination.Namespace)
+	now := time.Now()
+
+	// Check if this is an error
+	isError := f.Verdict == Verdict_DROPPED || f.Verdict == Verdict_ERROR
+
+	// Add error sample to history
+	sample := ErrorSample{
+		Timestamp: now,
+		IsError:   isError,
+	}
+
+	ad.errorBurstHistory[endpoint] = append(ad.errorBurstHistory[endpoint], sample)
+
+	// Keep only last 30 seconds of data
+	thirtySecondsAgo := now.Add(-30 * time.Second)
+	var recentSamples []ErrorSample
+	for _, s := range ad.errorBurstHistory[endpoint] {
+		if s.Timestamp.After(thirtySecondsAgo) {
+			recentSamples = append(recentSamples, s)
+		}
+	}
+	ad.errorBurstHistory[endpoint] = recentSamples
+
+	// Check for error burst: > 10 errors in 30 seconds
+	if len(ad.errorBurstHistory[endpoint]) >= 10 {
+		errorCount := 0
+		for _, s := range ad.errorBurstHistory[endpoint] {
+			if s.IsError {
+				errorCount++
 			}
 		}
-	}
-}
 
-// checkUnusualDestinations checks for connections to unusual destinations
-func (ad *AnomalyDetector) checkUnusualDestinations(f *Flow) {
-	if f.IP != nil {
-		destIP := f.IP.Destination
-		if destIP != "" {
-			if !ad.isKnownDestination(destIP) {
-				ad.unusualDests[destIP]++
-				if ad.unusualDests[destIP] > ad.config.AlertThresholds.UnusualDestinationThreshold {
-					alert := Alert{
-						Type:     "UNUSUAL_DESTINATION",
-						Severity: "HIGH",
-						Message: fmt.Sprintf("Unusual destination activity detected: %s (%d connections)",
-							destIP, ad.unusualDests[destIP]),
-						Timestamp: time.Now(),
-						FlowData:  f,
-					}
-					ad.sendAlert(alert)
-				}
+		// Alert if more than 10 errors in 30 seconds
+		if errorCount > 10 {
+			alert := Alert{
+				Type:     "ERROR_BURST",
+				Severity: "HIGH",
+				Message: fmt.Sprintf("Error burst detected: %s: %d errors in 30 seconds",
+					endpoint, errorCount),
+				Timestamp: now,
+				FlowData:  f,
 			}
+			ad.sendAlert(alert)
 		}
 	}
-}
-
-// checkDroppedPackets checks for high packet drop rates
-func (ad *AnomalyDetector) checkDroppedPackets(f *Flow) {
-	if ad.flowStats.DropRate > ad.config.AlertThresholds.DropRateThreshold {
-		alert := Alert{
-			Type:     "HIGH_DROP_RATE",
-			Severity: "HIGH",
-			Message: fmt.Sprintf("High packet drop rate detected: %.2f%% (threshold: %.2f%%)",
-				ad.flowStats.DropRate, ad.config.AlertThresholds.DropRateThreshold),
-			Timestamp: time.Now(),
-			FlowData:  f,
-			Stats:     ad.flowStats,
-		}
-		ad.sendAlert(alert)
-	}
-}
-
-// checkHighConnectionRate checks for unusually high connection rates
-func (ad *AnomalyDetector) checkHighConnectionRate(f *Flow) {
-	if ad.flowStats.ConnectionRate > float64(ad.config.AlertThresholds.HighConnectionThreshold) {
-		alert := Alert{
-			Type:     "HIGH_CONNECTION_RATE",
-			Severity: "MEDIUM",
-			Message: fmt.Sprintf("High connection rate detected: %.2f connections/s (threshold: %d)",
-				ad.flowStats.ConnectionRate, ad.config.AlertThresholds.HighConnectionThreshold),
-			Timestamp: time.Now(),
-			FlowData:  f,
-			Stats:     ad.flowStats,
-		}
-		ad.sendAlert(alert)
-	}
-}
-
-// isKnownPort checks if a port is a known/common port
-func (ad *AnomalyDetector) isKnownPort(port uint32) bool {
-	commonPorts := map[uint32]bool{
-		22:    true, // SSH
-		23:    true, // Telnet
-		25:    true, // SMTP
-		53:    true, // DNS
-		80:    true, // HTTP
-		110:   true, // POP3
-		143:   true, // IMAP
-		443:   true, // HTTPS
-		993:   true, // IMAPS
-		995:   true, // POP3S
-		3389:  true, // RDP
-		5432:  true, // PostgreSQL
-		3306:  true, // MySQL
-		6379:  true, // Redis
-		27017: true, // MongoDB
-	}
-
-	if commonPorts[port] {
-		return true
-	}
-
-	// Check if we've seen this port before and it's not unusual
-	ad.knownPorts[port] = true
-	return false
-}
-
-// isKnownDestination checks if a destination IP is known
-func (ad *AnomalyDetector) isKnownDestination(ip string) bool {
-	// This is a simplified check - in practice, you'd want more sophisticated logic
-	// to determine what constitutes a "known" destination
-	if ad.knownDests[ip] {
-		return true
-	}
-
-	// Add to known destinations after first encounter
-	ad.knownDests[ip] = true
-	return false
 }
 
 // sendAlert sends an alert to the alert channel
 func (ad *AnomalyDetector) sendAlert(alert Alert) {
 	select {
 	case ad.alertChannel <- alert:
-		ad.logger.WithFields(logrus.Fields{
-			"type":     alert.Type,
-			"severity": alert.Severity,
-			"message":  alert.Message,
-		}).Warn("Anomaly detected")
+		// Alert sent successfully - will be printed by printAnomalyAlert function
 	default:
 		ad.logger.Error("Alert channel is full, dropping alert")
 	}
@@ -308,160 +404,12 @@ func (ad *AnomalyDetector) ResetStats() {
 	defer ad.mu.Unlock()
 
 	ad.flowStats = &FlowStats{LastReset: time.Now()}
-	ad.unusualPorts = make(map[uint32]int)
-	ad.unusualDests = make(map[string]int)
-	ad.unusualNamespace = make(map[string]int)
 
-	// Reset namespace stats
-	for _, nsStats := range ad.namespaceStats {
-		nsStats.TotalFlows = 0
-		nsStats.TotalBytes = 0
-		nsStats.TotalConnections = 0
-		nsStats.DroppedPackets = 0
-		nsStats.LastReset = time.Now()
-		nsStats.FlowRate = 0
-		nsStats.ByteRate = 0
-		nsStats.ConnectionRate = 0
-		nsStats.DropRate = 0
-	}
-}
-
-// updateNamespaceStats updates statistics for specific namespaces
-func (ad *AnomalyDetector) updateNamespaceStats(f *Flow, bytes int64) {
-	// Update source namespace stats
-	if f.Source != nil && f.Source.Namespace != "" {
-		ad.updateNamespaceStatsForNamespace(f.Source.Namespace, bytes, f)
-	}
-
-	// Update destination namespace stats
-	if f.Destination != nil && f.Destination.Namespace != "" {
-		ad.updateNamespaceStatsForNamespace(f.Destination.Namespace, bytes, f)
-	}
-}
-
-// updateNamespaceStatsForNamespace updates stats for a specific namespace
-func (ad *AnomalyDetector) updateNamespaceStatsForNamespace(namespace string, bytes int64, f *Flow) {
-	nsStats, exists := ad.namespaceStats[namespace]
-	if !exists {
-		nsStats = &NamespaceStats{
-			Namespace: namespace,
-			LastReset: time.Now(),
-		}
-		ad.namespaceStats[namespace] = nsStats
-	}
-
-	nsStats.TotalFlows++
-	nsStats.TotalBytes += bytes
-
-	if f.Type == FlowType_L3_L4 || f.Type == FlowType_L7 {
-		nsStats.TotalConnections++
-	}
-
-	if f.Verdict == Verdict_DROPPED {
-		nsStats.DroppedPackets++
-	}
-
-	// Calculate rates for this namespace
-	now := time.Now()
-	timeDiff := now.Sub(nsStats.LastReset).Seconds()
-	if timeDiff > 0 {
-		nsStats.FlowRate = float64(nsStats.TotalFlows) / timeDiff
-		nsStats.ByteRate = float64(nsStats.TotalBytes) / timeDiff
-		nsStats.ConnectionRate = float64(nsStats.TotalConnections) / timeDiff
-		nsStats.DropRate = (float64(nsStats.DroppedPackets) / float64(nsStats.TotalFlows)) * 100
-	}
-}
-
-// checkNamespaceAnomalies checks for anomalies related to namespaces
-func (ad *AnomalyDetector) checkNamespaceAnomalies(f *Flow) {
-	// Check for unusual namespace activity
-	if f.Source != nil && f.Source.Namespace != "" {
-		ad.checkUnusualNamespaceActivity(f.Source.Namespace, f, "source")
-	}
-
-	if f.Destination != nil && f.Destination.Namespace != "" {
-		ad.checkUnusualNamespaceActivity(f.Destination.Namespace, f, "destination")
-	}
-
-	// Check for cross-namespace communication anomalies
-	ad.checkCrossNamespaceAnomalies(f)
-}
-
-// checkUnusualNamespaceActivity checks for unusual activity in a namespace
-func (ad *AnomalyDetector) checkUnusualNamespaceActivity(namespace string, f *Flow, direction string) {
-	nsStats, exists := ad.namespaceStats[namespace]
-	if !exists {
-		return
-	}
-
-	// Check for high bandwidth in namespace
-	if nsStats.ByteRate > float64(ad.config.AlertThresholds.NamespaceBandwidthThreshold) {
-		alert := Alert{
-			Type:     "HIGH_NAMESPACE_BANDWIDTH",
-			Severity: "MEDIUM",
-			Message: fmt.Sprintf("High bandwidth detected in namespace '%s' (%s): %.2f bytes/s",
-				namespace, direction, nsStats.ByteRate),
-			Timestamp: time.Now(),
-			FlowData:  f,
-		}
-		ad.sendAlert(alert)
-	}
-
-	// Check for high connection rate in namespace
-	if nsStats.ConnectionRate > float64(ad.config.AlertThresholds.NamespaceConnectionThreshold) {
-		alert := Alert{
-			Type:     "HIGH_NAMESPACE_CONNECTION_RATE",
-			Severity: "MEDIUM",
-			Message: fmt.Sprintf("High connection rate detected in namespace '%s' (%s): %.2f connections/s",
-				namespace, direction, nsStats.ConnectionRate),
-			Timestamp: time.Now(),
-			FlowData:  f,
-		}
-		ad.sendAlert(alert)
-	}
-
-	// Check for high drop rate in namespace
-	if nsStats.DropRate > ad.config.AlertThresholds.DropRateThreshold {
-		alert := Alert{
-			Type:     "HIGH_NAMESPACE_DROP_RATE",
-			Severity: "HIGH",
-			Message: fmt.Sprintf("High drop rate detected in namespace '%s' (%s): %.2f%%",
-				namespace, direction, nsStats.DropRate),
-			Timestamp: time.Now(),
-			FlowData:  f,
-		}
-		ad.sendAlert(alert)
-	}
-}
-
-// checkCrossNamespaceAnomalies checks for anomalies in cross-namespace communication
-func (ad *AnomalyDetector) checkCrossNamespaceAnomalies(f *Flow) {
-	if f.Source == nil || f.Destination == nil {
-		return
-	}
-
-	sourceNS := f.Source.Namespace
-	destNS := f.Destination.Namespace
-
-	// Skip if same namespace or empty namespaces
-	if sourceNS == "" || destNS == "" || sourceNS == destNS {
-		return
-	}
-
-	// Check for unusual cross-namespace communication
-	crossNSKey := fmt.Sprintf("%s->%s", sourceNS, destNS)
-	ad.unusualNamespace[crossNSKey]++
-
-	// Alert if too many cross-namespace connections
-	if ad.unusualNamespace[crossNSKey] > ad.config.AlertThresholds.CrossNamespaceThreshold {
-		alert := Alert{
-			Type:     "UNUSUAL_CROSS_NAMESPACE",
-			Severity: "MEDIUM",
-			Message: fmt.Sprintf("Unusual cross-namespace communication detected: %s (%d connections)",
-				crossNSKey, ad.unusualNamespace[crossNSKey]),
-			Timestamp: time.Now(),
-			FlowData:  f,
-		}
-		ad.sendAlert(alert)
-	}
+	// Reset new detection maps
+	ad.trafficBaseline = make(map[string]float64)
+	ad.trafficHistory = make(map[string][]TrafficSample)
+	ad.connectionCounts = make(map[string]int)
+	ad.connectionWindow = make(map[string]time.Time)
+	ad.httpStats = make(map[string]*HTTPStats)
+	ad.errorBurstHistory = make(map[string][]ErrorSample)
 }
