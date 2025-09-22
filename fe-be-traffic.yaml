@@ -1,0 +1,224 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-api
+  namespace: default
+  labels:
+    app: demo-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: demo-api
+  template:
+    metadata:
+      labels:
+        app: demo-api
+    spec:
+      containers:
+        - name: api
+          image: mccutchen/go-httpbin:v2.14.0
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-api
+  namespace: default
+  labels:
+    app: demo-api
+spec:
+  selector:
+    app: demo-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: demo-frontend-config
+  namespace: default
+data:
+  nginx.conf: |
+    events {}
+    http {
+      upstream demo_api {
+        server demo-api.default.svc.cluster.local:80;
+      }
+      server {
+        listen 8080;
+        # Static page
+        location / {
+          root /usr/share/nginx/html;
+          index index.html;
+        }
+        # Proxy to backend
+        location /api/ {
+          proxy_pass http://demo_api/;
+        }
+      }
+    }
+  index.html: |
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8"/>
+      <title>Demo FE → BE Traffic</title>
+      <style>
+        body { font-family: system-ui, Arial; margin: 20px; }
+        .row { display:flex; gap:12px; align-items:center; margin:8px 0; }
+        .badge { padding:2px 8px; border-radius:8px; background:#eee; }
+        #log { height: 260px; overflow:auto; border:1px solid #ddd; padding:8px; }
+      </style>
+    </head>
+    <body>
+      <h2>Demo Frontend → Backend (via Nginx proxy)</h2>
+
+      <div class="row">
+        <span class="badge">Target</span>
+        <code>/api/delay/{0–2}s</code> and <code>/api/status/{200,204,404,500}</code>
+      </div>
+
+      <div class="row">
+        <button id="normal">Normal Traffic</button>
+        <button id="spike">Traffic Spike</button>
+        <button id="ddos">DDoS Flood</button>
+        <button id="errors">Error Burst</button>
+        <button id="latency">High Latency</button>
+        <button id="stop">Stop</button>
+        <label>Interval (ms):
+          <input id="ival" type="number" value="500" min="100" step="100"/>
+        </label>
+      </div>
+
+      <div id="log"></div>
+
+      <script>
+        let timer=null;
+        const log = (m) => {
+          const el = document.getElementById('log');
+          const t = new Date().toLocaleTimeString();
+          el.innerText = `[${t}] ${m}\n` + el.innerText;
+        };
+
+        const pick = (arr)=>arr[Math.floor(Math.random()*arr.length)];
+
+        async function send(path) {
+          const url = `/api/${path}`;
+          const t0 = performance.now();
+          try {
+            const res = await fetch(url, { cache:"no-store" });
+            const t1 = performance.now();
+            log(`${url} → ${res.status} (${(t1-t0).toFixed(0)} ms)`);
+          } catch (e) {
+            log(`${url} → ERROR ${e}`);
+          }
+        }
+
+        function startTraffic(generator, interval) {
+          if (timer) clearInterval(timer);
+          timer = setInterval(generator, interval);
+          log(`Started ${generator.name} at interval ${interval} ms`);
+        }
+
+        document.getElementById('normal').onclick = ()=>{
+          const ival = parseInt(document.getElementById('ival').value||500,10);
+          startTraffic(()=> {
+            const path = Math.random()<0.5
+              ? `delay/${(Math.random()*2).toFixed(1)}`
+              : `status/${pick([200,204,404])}`;
+            send(path);
+          }, ival);
+        };
+
+        document.getElementById('spike').onclick = ()=>{
+          if (timer) clearInterval(timer);
+          timer = setInterval(()=>{
+            for (let i=0;i<20;i++) send(`status/${pick([200,200,200,404])}`);
+            log("Spike burst sent (20 requests)");
+          }, 5000);
+        };
+
+        document.getElementById('ddos').onclick = ()=>{
+          startTraffic(()=> send(`status/${pick([200,204,404])}`), 50);
+        };
+
+        document.getElementById('errors').onclick = ()=>{
+          startTraffic(()=> send("status/500"), 1000);
+        };
+
+        document.getElementById('latency').onclick = ()=>{
+          startTraffic(()=> send("delay/2"), 1000);
+        };
+
+        document.getElementById('stop').onclick = ()=>{
+          if (timer) clearInterval(timer);
+          timer=null;
+          log("Stopped");
+        };
+      </script>
+    </body>
+    </html>
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-frontend
+  namespace: default
+  labels:
+    app: demo-frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demo-frontend
+  template:
+    metadata:
+      labels:
+        app: demo-frontend
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.25-alpine
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: cfg
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+            - name: html
+              mountPath: /usr/share/nginx/html/index.html
+              subPath: index.html
+      volumes:
+        - name: cfg
+          configMap:
+            name: demo-frontend-config
+            items:
+              - key: nginx.conf
+                path: nginx.conf
+        - name: html
+          configMap:
+            name: demo-frontend-config
+            items:
+              - key: index.html
+                path: index.html
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-frontend
+  namespace: default
+  labels:
+    app: demo-frontend
+spec:
+  selector:
+    app: demo-frontend
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP

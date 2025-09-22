@@ -26,25 +26,3 @@ type AlertThresholds struct {
 	NamespaceConnectionThreshold int           `json:"namespace_connection_threshold"` // connections per second per namespace
 	CrossNamespaceThreshold      int           `json:"cross_namespace_threshold"`      // cross-namespace connections threshold
 }
-
-// DefaultConfig returns a default configuration
-func DefaultConfig() *Config {
-	return &Config{
-		HubbleServer:  "localhost:4245",
-		FlowFilters:   []string{},
-		CheckInterval: 5 * time.Second,
-		AlertThresholds: AlertThresholds{
-			HighBandwidthThreshold:       100000000, // 100MB/s
-			HighConnectionThreshold:      1000,      // 1000 connections/s
-			UnusualPortThreshold:         50,        // 50 connections to unusual ports
-			DropRateThreshold:            5.0,       // 5% drop rate
-			TimeWindow:                   60 * time.Second,
-			UnusualDestinationThreshold:  100,      // 100 connections to unusual destinations
-			NamespaceBandwidthThreshold:  50000000, // 50MB/s per namespace
-			NamespaceConnectionThreshold: 500,      // 500 connections/s per namespace
-			CrossNamespaceThreshold:      50,       // 50 cross-namespace connections
-		},
-		LogLevel:      "info",
-		UseRealClient: true, // Use gRPC client by default
-	}
-}

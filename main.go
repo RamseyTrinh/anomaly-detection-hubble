@@ -10,6 +10,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
 func main() {
@@ -113,4 +115,98 @@ func viewFlows(client *HubbleGRPCClient, namespace string) {
 			fmt.Printf("❌ Flow streaming failed: %v\n", err)
 		}
 	}
+}
+
+// detectAnomaly handles the anomaly detection functionality
+func detectAnomaly(client *HubbleGRPCClient, namespace string) {
+	fmt.Println("\n🚨 ANOMALY DETECTION")
+	fmt.Println("Connecting to Redis and starting anomaly detection...")
+	fmt.Println("Press Ctrl+C to return to main menu")
+	fmt.Println("")
+
+	// Create logger
+	logger := logrus.New()
+	logger.SetLevel(logrus.InfoLevel)
+
+	// Create config
+	config := &Config{
+		// Add your config here if needed
+	}
+
+	// Initialize anomaly detector with Redis
+	detector, err := NewAnomalyDetector(config, logger)
+	if err != nil {
+		fmt.Printf("❌ Failed to initialize anomaly detector: %v\n", err)
+		return
+	}
+	defer detector.Close()
+
+	// Setup signal handling
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Start streaming flows with anomaly detection
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Handle shutdown signals
+	go func() {
+		<-sigChan
+		fmt.Println("\n🛑 Stopping anomaly detection...")
+		cancel()
+	}()
+
+	// Alert monitoring handled by rule engine directly
+
+	// Start Redis stats monitoring
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				printRedisStats(detector)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	fmt.Println("✅ Anomaly detection started!")
+	fmt.Println("📊 Monitoring flows and detecting anomalies...")
+	fmt.Println("")
+
+	// Stream flows with anomaly detection
+	if err := client.StreamFlowsWithDetection(ctx, namespace, detector); err != nil {
+		if err == context.Canceled {
+			fmt.Println("✅ Anomaly detection stopped")
+		} else {
+			fmt.Printf("❌ Anomaly detection failed: %v\n", err)
+		}
+	}
+}
+
+// Legacy printAnomalyAlert function removed - alerts now handled by rule engine
+
+// printRedisStats prints Redis cache statistics
+func printRedisStats(detector *AnomalyDetector) {
+	stats, err := detector.GetRedisStats()
+	if err != nil {
+		fmt.Printf("❌ Failed to get Redis stats: %v\n", err)
+		return
+	}
+
+	ruleStats := detector.GetRuleEngineStats()
+
+	fmt.Printf("\n📊 REDIS CACHE STATS\n")
+	fmt.Printf("Flow Keys: %v\n", stats["flow_keys_count"])
+	fmt.Printf("Window Keys: %v\n", stats["window_keys_count"])
+	fmt.Printf("Buffer Size: %v/%v\n", stats["buffer_size"], stats["buffer_capacity"])
+
+	if ruleStats != nil {
+		fmt.Printf("Rules: %v enabled, %v disabled\n",
+			ruleStats["enabled_rules"], ruleStats["disabled_rules"])
+	}
+	fmt.Println(strings.Repeat("-", 30))
 }

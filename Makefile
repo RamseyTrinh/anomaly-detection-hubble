@@ -10,6 +10,10 @@ VERSION=1.0.0
 # Default target
 all: build
 
+run-help:
+	@echo "Usage: make <target>"
+	@./$(BUILD_DIR)/$(BINARY_NAME) --help
+
 # Build the application
 build:
 	@echo "Building $(BINARY_NAME)..."
