@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,12 +12,13 @@ import (
 
 // RuleEngine processes flow data from Redis and detects anomalies
 type RuleEngine struct {
-	flowCache    *FlowCache
-	logger       *logrus.Logger
-	alertChannel chan Alert
-	ctx          context.Context
-	cancel       context.CancelFunc
-	mu           sync.RWMutex
+	flowCache     *FlowCache
+	logger        *logrus.Logger
+	alertChannel  chan Alert
+	ctx           context.Context
+	cancel        context.CancelFunc
+	mu            sync.RWMutex
+	lastStatusLog time.Time
 
 	// Rule configurations
 	rules map[string]*RuleConfig
@@ -62,44 +64,47 @@ func NewRuleEngine(flowCache *FlowCache, logger *logrus.Logger) *RuleEngine {
 	return re
 }
 
-// initializeDefaultRules sets up default anomaly detection rules
+// initializeDefaultRules sets up new anomaly detection rules
 func (re *RuleEngine) initializeDefaultRules() {
-	re.rules["high_error_rate"] = &RuleConfig{
-		Name:        "High Error Rate",
+	// 1. DDoS Spike Rule: >50 flows trong 5s
+	re.rules["ddos_spike"] = &RuleConfig{
+		Name:        "DDoS Spike",
 		Enabled:     true,
-		WindowSize:  60,  // 1 minute
-		Threshold:   5.0, // 5%
-		Severity:    "HIGH",
-		Description: "Detects when error rate exceeds threshold",
-	}
-
-	re.rules["traffic_spike"] = &RuleConfig{
-		Name:        "Traffic Spike",
-		Enabled:     true,
-		WindowSize:  300,   // 5 minutes
-		Threshold:   200.0, // 200% increase
-		Severity:    "HIGH",
-		Description: "Detects sudden traffic spikes",
-	}
-
-	re.rules["connection_flood"] = &RuleConfig{
-		Name:        "Connection Flood",
-		Enabled:     true,
-		WindowSize:  10,    // 10 seconds
-		Threshold:   100.0, // 100 connections
+		WindowSize:  5,    // 5 seconds
+		Threshold:   50.0, // 50 flows
 		Severity:    "CRITICAL",
-		Description: "Detects DDoS-like connection floods",
+		Description: "Detects DDoS attacks with >50 flows in 5 seconds",
 	}
 
-	re.rules["error_burst"] = &RuleConfig{
-		Name:        "Error Burst",
+	// 2. Traffic Drop Rule: 30s không có traffic
+	re.rules["traffic_drop"] = &RuleConfig{
+		Name:        "Traffic Drop",
+		Enabled:     true,
+		WindowSize:  30,  // 30 seconds
+		Threshold:   0.0, // 0 flows (no traffic)
+		Severity:    "CRITICAL",
+		Description: "Detects service down - no traffic for 30 seconds",
+	}
+
+	// 3. Port Scan Rule: >20 unique ports trong 30s
+	re.rules["port_scan"] = &RuleConfig{
+		Name:        "Port Scan",
 		Enabled:     true,
 		WindowSize:  30,   // 30 seconds
-		Threshold:   10.0, // 10 errors
+		Threshold:   20.0, // 20 unique ports
 		Severity:    "HIGH",
-		Description: "Detects error bursts in short time windows",
+		Description: "Detects port scanning - >20 unique ports in 30 seconds",
 	}
 
+	// 4. Cross-Namespace Rule: traffic sang namespace khác
+	re.rules["cross_namespace"] = &RuleConfig{
+		Name:        "Cross-Namespace",
+		Enabled:     true,
+		WindowSize:  60,  // 60 seconds
+		Threshold:   1.0, // Any cross-namespace traffic
+		Severity:    "MEDIUM",
+		Description: "Detects cross-namespace traffic not in allow-list",
+	}
 }
 
 // Start begins the rule engine processing
@@ -122,7 +127,7 @@ func (re *RuleEngine) Stop() {
 
 // periodicEvaluation runs rule evaluation periodically
 func (re *RuleEngine) periodicEvaluation() {
-	ticker := time.NewTicker(10 * time.Second) // Evaluate every 10 seconds
+	ticker := time.NewTicker(5 * time.Second) // Evaluate every 5 seconds (faster for testing)
 	defer ticker.Stop()
 
 	for {
@@ -140,31 +145,72 @@ func (re *RuleEngine) evaluateAllRules() {
 	re.mu.RLock()
 	defer re.mu.RUnlock()
 
+	// Get flow windows for status display
+	windows, err := re.flowCache.GetFlowWindows(60) // 60 second window
+	if err != nil {
+		re.logger.Errorf("Failed to get flow windows: %v", err)
+		return
+	}
+
+	// Calculate total requests across all windows
+	totalRequests := 0
+	for _, window := range windows {
+		totalRequests += window.Count
+	}
+
+	// Display status every 60 seconds
+	if time.Since(re.lastStatusLog) > 60*time.Second {
+		re.logger.Infof("📊 Status: %d total requests in last 60s - Normal", totalRequests)
+		re.lastStatusLog = time.Now()
+	}
+
+	// Hiển thị thông tin về baseline nếu cần
+	if len(windows) > 0 {
+		re.logger.Debugf("📈 Analyzing %d flow windows for anomaly detection", len(windows))
+
+		// Debug: In chi tiết các flow windows
+		for i, window := range windows {
+			re.logger.Debugf("   Window %d: %s (%d flows)", i+1, window.Key, window.Count)
+		}
+	}
+
+	enabledCount := 0
+	alertCount := 0
 	for ruleName, config := range re.rules {
 		if !config.Enabled {
 			continue
 		}
+		enabledCount++
+		if re.evaluateRule(ruleName, config) {
+			alertCount++
+		}
+	}
 
-		re.evaluateRule(ruleName, config)
+	if alertCount > 0 {
+		re.logger.Warnf("🚨 %d anomalies detected out of %d rules", alertCount, enabledCount)
 	}
 }
 
-// evaluateRule evaluates a specific rule
-func (re *RuleEngine) evaluateRule(ruleName string, config *RuleConfig) {
+// evaluateRule evaluates a specific rule and returns true if any alerts were triggered
+func (re *RuleEngine) evaluateRule(ruleName string, config *RuleConfig) bool {
 	// Get flow windows from Redis
 	windows, err := re.flowCache.GetFlowWindows(config.WindowSize)
 	if err != nil {
 		re.logger.Errorf("Failed to get flow windows for rule %s: %v", ruleName, err)
-		return
+		return false
 	}
 
+	alertTriggered := false
 	// Evaluate rule for each window
 	for _, window := range windows {
 		result := re.runRule(ruleName, config, window)
 		if result.Triggered {
 			re.handleRuleResult(result)
+			alertTriggered = true
 		}
 	}
+
+	return alertTriggered
 }
 
 // runRule executes a specific rule against a flow window
@@ -185,14 +231,14 @@ func (re *RuleEngine) runRule(ruleName string, config *RuleConfig, window *FlowW
 	result.Metrics = metrics
 
 	switch ruleName {
-	case "high_error_rate":
-		result = re.checkHighErrorRate(config, metrics, result)
-	case "traffic_spike":
-		result = re.checkTrafficSpike(config, metrics, result)
-	case "connection_flood":
-		result = re.checkConnectionFlood(config, metrics, result)
-	case "error_burst":
-		result = re.checkErrorBurst(config, metrics, result)
+	case "ddos_spike":
+		result = re.checkDDoSSpike(config, metrics, result)
+	case "traffic_drop":
+		result = re.checkTrafficDrop(config, metrics, result)
+	case "port_scan":
+		result = re.checkPortScan(config, metrics, result)
+	case "cross_namespace":
+		result = re.checkCrossNamespace(config, metrics, result)
 	default:
 		re.logger.Warnf("Unknown rule: %s", ruleName)
 	}
@@ -200,61 +246,114 @@ func (re *RuleEngine) runRule(ruleName string, config *RuleConfig, window *FlowW
 	return result
 }
 
-// checkHighErrorRate checks for high error rates
-func (re *RuleEngine) checkHighErrorRate(config *RuleConfig, metrics *FlowMetrics, result *RuleResult) *RuleResult {
-	if metrics.ErrorRate > config.Threshold {
+// checkDDoSSpike checks for DDoS attacks with >50 flows in 5 seconds
+func (re *RuleEngine) checkDDoSSpike(config *RuleConfig, metrics *FlowMetrics, result *RuleResult) *RuleResult {
+	if metrics.TotalFlows > int64(config.Threshold) {
 		result.Triggered = true
 		result.Severity = config.Severity
-		result.Message = fmt.Sprintf("High error rate detected: %.2f%% error rate (threshold: %.2f%%) for %s",
-			metrics.ErrorRate, config.Threshold, metrics.Key)
-		result.Details["error_rate"] = metrics.ErrorRate
-		result.Details["error_count"] = metrics.ErrorCount
+		result.Message = fmt.Sprintf("DDoS Attack Detected: %d flows in %ds (threshold: %.0f) - %s",
+			metrics.TotalFlows, config.WindowSize, config.Threshold, metrics.Key)
 		result.Details["total_flows"] = metrics.TotalFlows
+		result.Details["window_duration"] = config.WindowSize
+		result.Details["threshold"] = config.Threshold
 	}
 	return result
 }
 
-// checkTrafficSpike checks for traffic spikes
-func (re *RuleEngine) checkTrafficSpike(config *RuleConfig, metrics *FlowMetrics, result *RuleResult) *RuleResult {
-	// This is a simplified check - in practice you'd compare with historical baseline
-	// For now, we'll check if byte rate is unusually high
-	if metrics.ByteRate > config.Threshold {
+// checkTrafficDrop checks for service down - no traffic for 30 seconds
+func (re *RuleEngine) checkTrafficDrop(config *RuleConfig, metrics *FlowMetrics, result *RuleResult) *RuleResult {
+	if metrics.TotalFlows == 0 {
 		result.Triggered = true
 		result.Severity = config.Severity
-		result.Message = fmt.Sprintf("Traffic spike detected: %.2f bytes/sec (threshold: %.2f) for %s",
-			metrics.ByteRate, config.Threshold, metrics.Key)
-		result.Details["byte_rate"] = metrics.ByteRate
-		result.Details["total_bytes"] = metrics.TotalBytes
-		result.Details["flow_rate"] = metrics.FlowRate
-	}
-	return result
-}
-
-// checkConnectionFlood checks for connection floods (DDoS patterns)
-func (re *RuleEngine) checkConnectionFlood(config *RuleConfig, metrics *FlowMetrics, result *RuleResult) *RuleResult {
-	if metrics.ConnectionCount > int64(config.Threshold) {
-		result.Triggered = true
-		result.Severity = config.Severity
-		result.Message = fmt.Sprintf("Connection flood detected: %d connections (threshold: %.0f) for %s",
-			metrics.ConnectionCount, config.Threshold, metrics.Key)
-		result.Details["connection_count"] = metrics.ConnectionCount
-		result.Details["connection_rate"] = float64(metrics.ConnectionCount) / float64(config.WindowSize)
-	}
-	return result
-}
-
-// checkErrorBurst checks for error bursts
-func (re *RuleEngine) checkErrorBurst(config *RuleConfig, metrics *FlowMetrics, result *RuleResult) *RuleResult {
-	if metrics.ErrorCount > int64(config.Threshold) {
-		result.Triggered = true
-		result.Severity = config.Severity
-		result.Message = fmt.Sprintf("Error burst detected: %d errors (threshold: %.0f) in %d seconds for %s",
-			metrics.ErrorCount, config.Threshold, config.WindowSize, metrics.Key)
-		result.Details["error_count"] = metrics.ErrorCount
-		result.Details["error_rate"] = metrics.ErrorRate
+		result.Message = fmt.Sprintf("Service Down Detected: No traffic for %ds - %s",
+			config.WindowSize, metrics.Key)
 		result.Details["total_flows"] = metrics.TotalFlows
+		result.Details["window_duration"] = config.WindowSize
+		result.Details["service_status"] = "DOWN"
 	}
 	return result
+}
+
+// checkPortScan checks for port scanning - >20 unique ports in 30 seconds
+func (re *RuleEngine) checkPortScan(config *RuleConfig, metrics *FlowMetrics, result *RuleResult) *RuleResult {
+	// Get unique ports for this source in the time window
+	uniquePorts, err := re.flowCache.GetUniquePortsForSource(metrics.Key, config.WindowSize)
+	if err != nil {
+		re.logger.Errorf("Failed to get unique ports for port scan check: %v", err)
+		return result
+	}
+
+	if len(uniquePorts) > int(config.Threshold) {
+		result.Triggered = true
+		result.Severity = config.Severity
+		result.Message = fmt.Sprintf("Port Scan Detected: %d unique ports in %ds (threshold: %.0f) - %s",
+			len(uniquePorts), config.WindowSize, config.Threshold, metrics.Key)
+		result.Details["unique_ports"] = len(uniquePorts)
+		result.Details["window_duration"] = config.WindowSize
+		result.Details["threshold"] = config.Threshold
+		result.Details["ports"] = uniquePorts
+	}
+	return result
+}
+
+// checkCrossNamespace checks for cross-namespace traffic not in allow-list
+func (re *RuleEngine) checkCrossNamespace(config *RuleConfig, metrics *FlowMetrics, result *RuleResult) *RuleResult {
+	// Extract namespace information from the key
+	// Key format: flow:srcPod:dstPod
+	keyParts := strings.Split(metrics.Key, ":")
+	if len(keyParts) < 3 {
+		re.logger.Warnf("Invalid flow key format for cross-namespace check: %s", metrics.Key)
+		return result
+	}
+
+	srcPod := keyParts[1]
+	dstPod := keyParts[2]
+
+	// Get namespace information for source and destination pods
+	srcNamespace, dstNamespace, err := re.flowCache.GetPodNamespaces(srcPod, dstPod)
+	if err != nil {
+		re.logger.Errorf("Failed to get pod namespaces: %v", err)
+		return result
+	}
+
+	// Check if this is cross-namespace traffic
+	if srcNamespace != dstNamespace {
+		// Check if this cross-namespace traffic is allowed
+		if !re.isCrossNamespaceAllowed(srcNamespace, dstNamespace) {
+			result.Triggered = true
+			result.Severity = config.Severity
+			result.Message = fmt.Sprintf("Cross-Namespace Traffic Detected: %s (%s) -> %s (%s) - %s",
+				srcPod, srcNamespace, dstPod, dstNamespace, metrics.Key)
+			result.Details["src_pod"] = srcPod
+			result.Details["src_namespace"] = srcNamespace
+			result.Details["dst_pod"] = dstPod
+			result.Details["dst_namespace"] = dstNamespace
+			result.Details["traffic_type"] = "CROSS_NAMESPACE"
+		}
+	}
+	return result
+}
+
+// isCrossNamespaceAllowed checks if cross-namespace traffic is allowed
+func (re *RuleEngine) isCrossNamespaceAllowed(srcNamespace, dstNamespace string) bool {
+	// Define allowed cross-namespace traffic patterns
+	allowedPatterns := map[string][]string{
+		"default":     {"kube-system", "monitoring"}, // default can talk to kube-system and monitoring
+		"kube-system": {"default"},                   // kube-system can talk to default
+		"monitoring":  {"default"},                   // monitoring can talk to default
+	}
+
+	allowedDstNamespaces, exists := allowedPatterns[srcNamespace]
+	if !exists {
+		return false // No cross-namespace traffic allowed from this namespace
+	}
+
+	for _, allowed := range allowedDstNamespaces {
+		if allowed == dstNamespace {
+			return true
+		}
+	}
+	return false
 }
 
 // handleRuleResult processes a triggered rule result
@@ -300,12 +399,28 @@ func (re *RuleEngine) alertProcessor() {
 
 // processAlert handles an alert (for now, just logs it)
 func (re *RuleEngine) processAlert(alert Alert) {
-	re.logger.WithFields(logrus.Fields{
-		"type":      alert.Type,
-		"severity":  alert.Severity,
-		"message":   alert.Message,
-		"timestamp": alert.Timestamp,
-	}).Warn("ANOMALY DETECTED")
+	timestamp := alert.Timestamp.Format("2006-01-02 15:04:05")
+
+	// Format severity with emoji
+	severityEmoji := "⚠️"
+	switch alert.Severity {
+	case "CRITICAL":
+		severityEmoji = "🚨"
+	case "HIGH":
+		severityEmoji = "🔴"
+	case "MEDIUM":
+		severityEmoji = "🟡"
+	case "LOW":
+		severityEmoji = "🟢"
+	}
+
+	// Display alert with clear formatting
+	re.logger.Warnf("%s [%s] %s %s", severityEmoji, timestamp, alert.Severity, alert.Message)
+
+	if alert.Stats != nil {
+		re.logger.Warnf("   📈 Stats: %d flows, %.2f flow/sec, %d connections",
+			alert.Stats.TotalFlows, alert.Stats.FlowRate, alert.Stats.TotalConnections)
+	}
 
 	// Here you could integrate with external alerting systems
 	// like Slack, PagerDuty, email, etc.

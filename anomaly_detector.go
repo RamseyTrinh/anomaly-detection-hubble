@@ -182,13 +182,7 @@ func (ad *AnomalyDetector) Close() error {
 	return nil
 }
 
-// GetRedisStats returns Redis cache statistics
-func (ad *AnomalyDetector) GetRedisStats() (map[string]interface{}, error) {
-	if ad.flowCache == nil {
-		return nil, fmt.Errorf("flow cache not initialized")
-	}
-	return ad.flowCache.GetStats()
-}
+// GetRedisStats function removed - not needed anymore
 
 // GetRuleEngineStats returns rule engine statistics
 func (ad *AnomalyDetector) GetRuleEngineStats() map[string]interface{} {
@@ -196,4 +190,12 @@ func (ad *AnomalyDetector) GetRuleEngineStats() map[string]interface{} {
 		return nil
 	}
 	return ad.ruleEngine.GetStats()
+}
+
+// GetRuleEngineAlertChannel returns the rule engine alert channel
+func (ad *AnomalyDetector) GetRuleEngineAlertChannel() <-chan Alert {
+	if ad.ruleEngine == nil {
+		return nil
+	}
+	return ad.ruleEngine.GetAlertChannel()
 }

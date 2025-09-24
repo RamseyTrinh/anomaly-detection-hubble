@@ -13,5 +13,5 @@
     "namespace_connection_threshold": 500,
     "cross_namespace_threshold": 50
   },
-  "log_level": "info"
+  "log_level": "warn"
 }

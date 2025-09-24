@@ -2,9 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"sync"
+	"strings"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -15,7 +14,6 @@ import (
 type FlowCache struct {
 	client     *redis.Client
 	logger     *logrus.Logger
-	mu         sync.RWMutex
 	flowBuffer chan *Flow
 	ctx        context.Context
 	cancel     context.CancelFunc
@@ -52,9 +50,11 @@ const (
 	RedisDB       = 0
 
 	// Redis key patterns
-	FlowKeyPrefix    = "hubble:flow:"
+	FlowKeyPrefix    = "flow:"
 	MetricsKeyPrefix = "hubble:metrics:"
 	WindowKeyPrefix  = "hubble:window:"
+	VerdictKeyPrefix = "flow:"
+	FlagsKeyPrefix   = "flow:"
 
 	// Time windows
 	DefaultWindowDuration = 60  // seconds
@@ -119,70 +119,160 @@ func (fc *FlowCache) flowProcessor() {
 	}
 }
 
-// storeFlow stores a single flow in Redis
+// storeFlow stores a single flow in Redis using Sorted Set
 func (fc *FlowCache) storeFlow(flow *Flow) {
 	if flow == nil {
 		return
 	}
 
-	// Create flow key based on source-destination
+	// Create flow key based on source-destination pods
 	key := fc.generateFlowKey(flow)
 
-	// Serialize flow to JSON
-	flowJSON, err := json.Marshal(flow)
-	if err != nil {
-		fc.logger.Errorf("Failed to marshal flow: %v", err)
-		return
+	// Get timestamp for sorting
+	timestamp := time.Now().Unix()
+	if flow.Time != nil {
+		timestamp = flow.Time.Unix()
 	}
 
-	// Store flow with TTL (expire after 5 minutes)
-	ttl := time.Duration(MaxWindowDuration) * time.Second
-	err = fc.client.Set(fc.ctx, key, flowJSON, ttl).Err()
+	// Create value with port|flags|verdict encoding
+	value := fc.encodeFlowValue(flow)
+
+	// Store in Sorted Set with timestamp as score
+	err := fc.client.ZAdd(fc.ctx, key, &redis.Z{
+		Score:  float64(timestamp),
+		Member: value,
+	}).Err()
 	if err != nil {
 		fc.logger.Errorf("Failed to store flow in Redis: %v", err)
 		return
 	}
 
-	// Add to time-based window
-	fc.addToWindow(key, flow)
+	// Set TTL for the key (expire after 10 minutes)
+	ttl := time.Duration(10) * time.Minute
+	fc.client.Expire(fc.ctx, key, ttl)
+
+	// Add to verdict and flags indexes
+	fc.addToIndexes(key, flow, timestamp)
+
+	// No bucket counting needed for new rules
 }
 
-// generateFlowKey creates a unique key for a flow
+// generateFlowKey creates a unique key for a flow using pod names
 func (fc *FlowCache) generateFlowKey(flow *Flow) string {
-	if flow.IP != nil {
-		// Use IP-based key for network flows
-		return fmt.Sprintf("%s%s:%s", FlowKeyPrefix, flow.IP.Source, flow.IP.Destination)
-	} else if flow.Source != nil && flow.Destination != nil {
-		// Use pod-based key for service flows
-		return fmt.Sprintf("%s%s:%s", FlowKeyPrefix, flow.Source.PodName, flow.Destination.PodName)
+	var srcPod, dstPod string
+
+	// Extract source pod name
+	if flow.Source != nil && flow.Source.PodName != "" {
+		srcPod = flow.Source.PodName
+	} else if flow.IP != nil {
+		srcPod = flow.IP.Source
+	} else {
+		srcPod = "unknown"
 	}
 
-	// Fallback to timestamp-based key
-	return fmt.Sprintf("%s%d", FlowKeyPrefix, time.Now().UnixNano())
-}
-
-// addToWindow adds flow to a time window for aggregation
-func (fc *FlowCache) addToWindow(key string, flow *Flow) {
-	windowKey := fmt.Sprintf("%s%s", WindowKeyPrefix, key)
-
-	// Add flow to sorted set with timestamp as score
-	score := float64(time.Now().Unix())
-	flowJSON, _ := json.Marshal(flow)
-
-	err := fc.client.ZAdd(fc.ctx, windowKey, &redis.Z{
-		Score:  score,
-		Member: flowJSON,
-	}).Err()
-
-	if err != nil {
-		fc.logger.Errorf("Failed to add flow to window: %v", err)
-		return
+	// Extract destination pod name
+	if flow.Destination != nil && flow.Destination.PodName != "" {
+		dstPod = flow.Destination.PodName
+	} else if flow.IP != nil {
+		dstPod = flow.IP.Destination
+	} else {
+		dstPod = "unknown"
 	}
 
-	// Set TTL for window
-	ttl := time.Duration(MaxWindowDuration) * time.Second
-	fc.client.Expire(fc.ctx, windowKey, ttl)
+	// Return key in format: flow:{srcPod}:{dstPod}
+	return fmt.Sprintf("%s%s:%s", FlowKeyPrefix, srcPod, dstPod)
 }
+
+// encodeFlowValue encodes flow data into a compact string format
+func (fc *FlowCache) encodeFlowValue(flow *Flow) string {
+	var port, flags, verdict string
+
+	// Extract port information
+	if flow.L4 != nil {
+		if flow.L4.TCP != nil {
+			port = fmt.Sprintf("%d|%d", flow.L4.TCP.SourcePort, flow.L4.TCP.DestinationPort)
+			// Extract TCP flags
+			if flow.L4.TCP.Flags != nil {
+				var flagList []string
+				if flow.L4.TCP.Flags.SYN {
+					flagList = append(flagList, "SYN")
+				}
+				if flow.L4.TCP.Flags.ACK {
+					flagList = append(flagList, "ACK")
+				}
+				if flow.L4.TCP.Flags.FIN {
+					flagList = append(flagList, "FIN")
+				}
+				if flow.L4.TCP.Flags.RST {
+					flagList = append(flagList, "RST")
+				}
+				if flow.L4.TCP.Flags.PSH {
+					flagList = append(flagList, "PSH")
+				}
+				if flow.L4.TCP.Flags.URG {
+					flagList = append(flagList, "URG")
+				}
+				if len(flagList) > 0 {
+					flags = strings.Join(flagList, ",")
+				}
+			}
+		} else if flow.L4.UDP != nil {
+			port = fmt.Sprintf("%d|%d", flow.L4.UDP.SourcePort, flow.L4.UDP.DestinationPort)
+		}
+	}
+
+	// Extract verdict
+	verdict = flow.Verdict.String()
+
+	// Return encoded value: port|flags|verdict
+	return fmt.Sprintf("%s|%s|%s", port, flags, verdict)
+}
+
+// addToIndexes adds flow to verdict and flags indexes
+func (fc *FlowCache) addToIndexes(key string, flow *Flow, timestamp int64) {
+	// Add to verdict index
+	verdictKey := fmt.Sprintf("%s%s", VerdictKeyPrefix, flow.Verdict.String())
+	fc.client.ZAdd(fc.ctx, verdictKey, &redis.Z{
+		Score:  float64(timestamp),
+		Member: key,
+	})
+	fc.client.Expire(fc.ctx, verdictKey, 10*time.Minute)
+
+	// Add to TCP flags indexes if available
+	if flow.L4 != nil && flow.L4.TCP != nil && flow.L4.TCP.Flags != nil {
+		flags := flow.L4.TCP.Flags
+		if flags.SYN {
+			fc.addToFlagsIndex("syn", key, timestamp)
+		}
+		if flags.ACK {
+			fc.addToFlagsIndex("ack", key, timestamp)
+		}
+		if flags.FIN {
+			fc.addToFlagsIndex("fin", key, timestamp)
+		}
+		if flags.RST {
+			fc.addToFlagsIndex("rst", key, timestamp)
+		}
+		if flags.PSH {
+			fc.addToFlagsIndex("psh", key, timestamp)
+		}
+		if flags.URG {
+			fc.addToFlagsIndex("urg", key, timestamp)
+		}
+	}
+}
+
+// addToFlagsIndex adds flow to a specific TCP flags index
+func (fc *FlowCache) addToFlagsIndex(flag string, key string, timestamp int64) {
+	flagsKey := fmt.Sprintf("%s%s", FlagsKeyPrefix, flag)
+	fc.client.ZAdd(fc.ctx, flagsKey, &redis.Z{
+		Score:  float64(timestamp),
+		Member: key,
+	})
+	fc.client.Expire(fc.ctx, flagsKey, 10*time.Minute)
+}
+
+// Connection establishment check removed - not needed for new rules
 
 // GetFlowMetrics retrieves aggregated metrics for a specific key
 func (fc *FlowCache) GetFlowMetrics(key string, windowDuration int64) (*FlowMetrics, error) {
@@ -193,14 +283,12 @@ func (fc *FlowCache) GetFlowMetrics(key string, windowDuration int64) (*FlowMetr
 		windowDuration = MaxWindowDuration
 	}
 
-	windowKey := fmt.Sprintf("%s%s", WindowKeyPrefix, key)
-
 	// Get flows from the last windowDuration seconds
 	cutoffTime := time.Now().Add(-time.Duration(windowDuration) * time.Second)
 	cutoffScore := float64(cutoffTime.Unix())
 
-	// Get flows in time window
-	flows, err := fc.client.ZRangeByScore(fc.ctx, windowKey, &redis.ZRangeBy{
+	// Get flows in time window from the main flow key
+	flows, err := fc.client.ZRangeByScore(fc.ctx, key, &redis.ZRangeBy{
 		Min: fmt.Sprintf("%.0f", cutoffScore),
 		Max: "+inf",
 	}).Result()
@@ -216,25 +304,23 @@ func (fc *FlowCache) GetFlowMetrics(key string, windowDuration int64) (*FlowMetr
 		LastUpdated:    time.Now(),
 	}
 
-	for _, flowJSON := range flows {
-		var flow Flow
-		if err := json.Unmarshal([]byte(flowJSON), &flow); err != nil {
-			fc.logger.Warnf("Failed to unmarshal flow: %v", err)
+	for _, encodedValue := range flows {
+		// Parse encoded value: port|flags|verdict
+		parts := strings.Split(encodedValue, "|")
+		if len(parts) < 3 {
 			continue
 		}
 
+		verdictStr := parts[2]
 		metrics.TotalFlows++
-		metrics.TotalBytes += fc.calculateBytes(&flow)
 
-		// Count errors
-		if flow.Verdict == Verdict_DROPPED || flow.Verdict == Verdict_ERROR {
+		// Count errors based on verdict
+		if verdictStr == "DROPPED" || verdictStr == "ERROR" {
 			metrics.ErrorCount++
 		}
 
-		// Count connections
-		if flow.Type == FlowType_L3_L4 || flow.Type == FlowType_L7 {
-			metrics.ConnectionCount++
-		}
+		// Count all connections (no unique filtering needed for new rules)
+		metrics.ConnectionCount++
 	}
 
 	// Calculate rates
@@ -250,17 +336,143 @@ func (fc *FlowCache) GetFlowMetrics(key string, windowDuration int64) (*FlowMetr
 	return metrics, nil
 }
 
+// GetFlowsByVerdict retrieves flows filtered by verdict
+func (fc *FlowCache) GetFlowsByVerdict(verdict string, windowDuration int64) ([]string, error) {
+	verdictKey := fmt.Sprintf("%s%s", VerdictKeyPrefix, verdict)
+
+	// Get flows from the last windowDuration seconds
+	cutoffTime := time.Now().Add(-time.Duration(windowDuration) * time.Second)
+	cutoffScore := float64(cutoffTime.Unix())
+
+	// Get flow keys from verdict index
+	flowKeys, err := fc.client.ZRangeByScore(fc.ctx, verdictKey, &redis.ZRangeBy{
+		Min: fmt.Sprintf("%.0f", cutoffScore),
+		Max: "+inf",
+	}).Result()
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get flows by verdict: %v", err)
+	}
+
+	return flowKeys, nil
+}
+
+// GetFlowsByFlags retrieves flows filtered by TCP flags
+func (fc *FlowCache) GetFlowsByFlags(flag string, windowDuration int64) ([]string, error) {
+	flagsKey := fmt.Sprintf("%s%s", FlagsKeyPrefix, flag)
+
+	// Get flows from the last windowDuration seconds
+	cutoffTime := time.Now().Add(-time.Duration(windowDuration) * time.Second)
+	cutoffScore := float64(cutoffTime.Unix())
+
+	// Get flow keys from flags index
+	flowKeys, err := fc.client.ZRangeByScore(fc.ctx, flagsKey, &redis.ZRangeBy{
+		Min: fmt.Sprintf("%.0f", cutoffScore),
+		Max: "+inf",
+	}).Result()
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get flows by flags: %v", err)
+	}
+
+	return flowKeys, nil
+}
+
+// GetFlowData retrieves actual flow data for a specific key
+func (fc *FlowCache) GetFlowData(key string, windowDuration int64) ([]string, error) {
+	// Get flows from the last windowDuration seconds
+	cutoffTime := time.Now().Add(-time.Duration(windowDuration) * time.Second)
+	cutoffScore := float64(cutoffTime.Unix())
+
+	// Get encoded flow values
+	flows, err := fc.client.ZRangeByScore(fc.ctx, key, &redis.ZRangeBy{
+		Min: fmt.Sprintf("%.0f", cutoffScore),
+		Max: "+inf",
+	}).Result()
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get flow data: %v", err)
+	}
+
+	return flows, nil
+}
+
+// Bucket functions removed - not needed for new rules
+
+// GetUniquePortsForSource gets unique destination ports for a source in time window
+func (fc *FlowCache) GetUniquePortsForSource(flowKey string, windowDuration int64) ([]string, error) {
+	// Get flows from the last windowDuration seconds
+	cutoffTime := time.Now().Add(-time.Duration(windowDuration) * time.Second)
+	cutoffScore := float64(cutoffTime.Unix())
+
+	// Get flows in time window from the main flow key
+	flows, err := fc.client.ZRangeByScore(fc.ctx, flowKey, &redis.ZRangeBy{
+		Min: fmt.Sprintf("%.0f", cutoffScore),
+		Max: "+inf",
+	}).Result()
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get flows from Redis: %v", err)
+	}
+
+	// Track unique destination ports
+	uniquePorts := make(map[string]bool)
+	for _, encodedValue := range flows {
+		// Parse encoded value: port|flags|verdict
+		parts := strings.Split(encodedValue, "|")
+		if len(parts) < 3 {
+			continue
+		}
+
+		portInfo := parts[0] // source_port|dest_port
+		portParts := strings.Split(portInfo, "|")
+		if len(portParts) >= 2 {
+			destPort := portParts[1]
+			uniquePorts[destPort] = true
+		}
+	}
+
+	// Convert map keys to slice
+	var ports []string
+	for port := range uniquePorts {
+		ports = append(ports, port)
+	}
+
+	return ports, nil
+}
+
+// GetPodNamespaces gets namespace information for source and destination pods
+func (fc *FlowCache) GetPodNamespaces(srcPod, dstPod string) (string, string, error) {
+	// For now, assume all pods are in "default" namespace
+	// In a real implementation, you would query Kubernetes API or cache this information
+	return "default", "default", nil
+}
+
 // GetFlowWindows retrieves all flow windows for analysis
 func (fc *FlowCache) GetFlowWindows(windowDuration int64) ([]*FlowWindow, error) {
 	if windowDuration <= 0 {
 		windowDuration = DefaultWindowDuration
 	}
 
-	// Get all window keys
-	pattern := fmt.Sprintf("%s*", WindowKeyPrefix)
-	keys, err := fc.client.Keys(fc.ctx, pattern).Result()
+	// Get all flow keys (not window keys, verdict keys, or flags keys)
+	pattern := fmt.Sprintf("%s*", FlowKeyPrefix)
+	allKeys, err := fc.client.Keys(fc.ctx, pattern).Result()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get window keys: %v", err)
+		return nil, fmt.Errorf("failed to get flow keys: %v", err)
+	}
+
+	// Filter out index keys (verdict/flags keys)
+	var keys []string
+	for _, key := range allKeys {
+		// Skip index keys that don't have pod:pod format
+		keyWithoutPrefix := key[len(FlowKeyPrefix):]
+		if strings.Contains(keyWithoutPrefix, ":") && !strings.Contains(keyWithoutPrefix, "UNKNOWN") &&
+			!strings.Contains(keyWithoutPrefix, "FORWARDED") && !strings.Contains(keyWithoutPrefix, "DROPPED") &&
+			!strings.Contains(keyWithoutPrefix, "syn") && !strings.Contains(keyWithoutPrefix, "ack") &&
+			!strings.Contains(keyWithoutPrefix, "fin") && !strings.Contains(keyWithoutPrefix, "rst") &&
+			!strings.Contains(keyWithoutPrefix, "psh") && !strings.Contains(keyWithoutPrefix, "urg") {
+			keys = append(keys, key)
+		}
 	}
 
 	var windows []*FlowWindow
@@ -268,7 +480,7 @@ func (fc *FlowCache) GetFlowWindows(windowDuration int64) ([]*FlowWindow, error)
 	cutoffScore := float64(cutoffTime.Unix())
 
 	for _, key := range keys {
-		// Get flows in time window
+		// Get flows in time window from flow key
 		flows, err := fc.client.ZRangeByScore(fc.ctx, key, &redis.ZRangeBy{
 			Min: fmt.Sprintf("%.0f", cutoffScore),
 			Max: "+inf",
@@ -283,42 +495,40 @@ func (fc *FlowCache) GetFlowWindows(windowDuration int64) ([]*FlowWindow, error)
 			continue
 		}
 
-		// Parse flows
+		// Parse encoded flows (no unique filtering needed for new rules)
 		var parsedFlows []Flow
-		for _, flowJSON := range flows {
-			var flow Flow
-			if err := json.Unmarshal([]byte(flowJSON), &flow); err != nil {
+		flowCount := 0
+
+		for _, encodedValue := range flows {
+			// Parse encoded value: port|flags|verdict
+			parts := strings.Split(encodedValue, "|")
+			if len(parts) < 3 {
 				continue
+			}
+
+			flowCount++
+
+			// Create a simple flow from encoded value
+			flow := Flow{
+				Time:    &cutoffTime,
+				Verdict: Verdict_FORWARDED, // Default verdict
 			}
 			parsedFlows = append(parsedFlows, flow)
 		}
 
-		// Create window
+		// Create window - keep the full key with prefix for consistency
 		window := &FlowWindow{
-			Key:       key[len(WindowKeyPrefix):], // Remove prefix
+			Key:       key, // Keep full key with prefix
 			Flows:     parsedFlows,
 			StartTime: cutoffTime,
 			EndTime:   time.Now(),
-			Count:     len(parsedFlows),
+			Count:     flowCount, // Count all flows, not unique connections
 		}
 
 		windows = append(windows, window)
 	}
 
 	return windows, nil
-}
-
-// calculateBytes estimates bytes from flow data
-func (fc *FlowCache) calculateBytes(flow *Flow) int64 {
-	if flow.L4 != nil {
-		if flow.L4.TCP != nil {
-			return int64(flow.L4.TCP.Bytes)
-		}
-		if flow.L4.UDP != nil {
-			return int64(flow.L4.UDP.Bytes)
-		}
-	}
-	return 0
 }
 
 // cleanupWorker periodically cleans up expired data
@@ -339,22 +549,30 @@ func (fc *FlowCache) cleanupWorker() {
 // cleanupExpiredData removes expired flow data
 func (fc *FlowCache) cleanupExpiredData() {
 	// Redis TTL handles most cleanup, but we can do additional cleanup here
-	// For example, remove empty windows
-	pattern := fmt.Sprintf("%s*", WindowKeyPrefix)
-	keys, err := fc.client.Keys(fc.ctx, pattern).Result()
-	if err != nil {
-		fc.logger.Errorf("Failed to get keys for cleanup: %v", err)
-		return
+	// Clean up empty sorted sets for all key types
+	patterns := []string{
+		fmt.Sprintf("%s*", FlowKeyPrefix),
+		fmt.Sprintf("%s*", WindowKeyPrefix),
+		fmt.Sprintf("%s*", VerdictKeyPrefix),
+		fmt.Sprintf("%s*", FlagsKeyPrefix),
 	}
 
-	for _, key := range keys {
-		count, err := fc.client.ZCard(fc.ctx, key).Result()
+	for _, pattern := range patterns {
+		keys, err := fc.client.Keys(fc.ctx, pattern).Result()
 		if err != nil {
+			fc.logger.Errorf("Failed to get keys for cleanup: %v", err)
 			continue
 		}
 
-		if count == 0 {
-			fc.client.Del(fc.ctx, key)
+		for _, key := range keys {
+			count, err := fc.client.ZCard(fc.ctx, key).Result()
+			if err != nil {
+				continue
+			}
+
+			if count == 0 {
+				fc.client.Del(fc.ctx, key)
+			}
 		}
 	}
 }
@@ -366,26 +584,4 @@ func (fc *FlowCache) Close() error {
 	return fc.client.Close()
 }
 
-// GetStats returns cache statistics
-func (fc *FlowCache) GetStats() (map[string]interface{}, error) {
-	stats := make(map[string]interface{})
-
-	// Get Redis info
-	info, err := fc.client.Info(fc.ctx).Result()
-	if err != nil {
-		return nil, err
-	}
-
-	stats["redis_info"] = info
-	stats["buffer_size"] = len(fc.flowBuffer)
-	stats["buffer_capacity"] = cap(fc.flowBuffer)
-
-	// Count keys
-	flowKeys, _ := fc.client.Keys(fc.ctx, fmt.Sprintf("%s*", FlowKeyPrefix)).Result()
-	windowKeys, _ := fc.client.Keys(fc.ctx, fmt.Sprintf("%s*", WindowKeyPrefix)).Result()
-
-	stats["flow_keys_count"] = len(flowKeys)
-	stats["window_keys_count"] = len(windowKeys)
-
-	return stats, nil
-}
+// GetStats function removed - not needed anymore

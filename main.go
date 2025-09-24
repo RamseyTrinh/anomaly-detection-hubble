@@ -126,7 +126,7 @@ func detectAnomaly(client *HubbleGRPCClient, namespace string) {
 
 	// Create logger
 	logger := logrus.New()
-	logger.SetLevel(logrus.InfoLevel)
+	logger.SetLevel(logrus.DebugLevel) // Enable debug logs
 
 	// Create config
 	config := &Config{
@@ -156,7 +156,22 @@ func detectAnomaly(client *HubbleGRPCClient, namespace string) {
 		cancel()
 	}()
 
-	// Alert monitoring handled by rule engine directly
+	// Start alert monitoring
+	go func() {
+		alertChannel := detector.GetRuleEngineAlertChannel()
+		for {
+			select {
+			case alert := <-alertChannel:
+				fmt.Printf("\n🚨 ALERT: [%s] %s - %s\n", alert.Severity, alert.Type, alert.Message)
+				if alert.Stats != nil {
+					fmt.Printf("   📊 Stats: %d flows, %d connections, %.2f flow/sec\n",
+						alert.Stats.TotalFlows, alert.Stats.TotalConnections, alert.Stats.FlowRate)
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	// Start Redis stats monitoring
 	go func() {
@@ -166,7 +181,7 @@ func detectAnomaly(client *HubbleGRPCClient, namespace string) {
 		for {
 			select {
 			case <-ticker.C:
-				printRedisStats(detector)
+				// Redis stats removed - not needed anymore
 			case <-ctx.Done():
 				return
 			}
@@ -189,24 +204,4 @@ func detectAnomaly(client *HubbleGRPCClient, namespace string) {
 
 // Legacy printAnomalyAlert function removed - alerts now handled by rule engine
 
-// printRedisStats prints Redis cache statistics
-func printRedisStats(detector *AnomalyDetector) {
-	stats, err := detector.GetRedisStats()
-	if err != nil {
-		fmt.Printf("❌ Failed to get Redis stats: %v\n", err)
-		return
-	}
-
-	ruleStats := detector.GetRuleEngineStats()
-
-	fmt.Printf("\n📊 REDIS CACHE STATS\n")
-	fmt.Printf("Flow Keys: %v\n", stats["flow_keys_count"])
-	fmt.Printf("Window Keys: %v\n", stats["window_keys_count"])
-	fmt.Printf("Buffer Size: %v/%v\n", stats["buffer_size"], stats["buffer_capacity"])
-
-	if ruleStats != nil {
-		fmt.Printf("Rules: %v enabled, %v disabled\n",
-			ruleStats["enabled_rules"], ruleStats["disabled_rules"])
-	}
-	fmt.Println(strings.Repeat("-", 30))
-}
+// printRedisStats function removed - not needed anymore

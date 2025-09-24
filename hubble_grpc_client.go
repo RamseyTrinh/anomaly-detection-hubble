@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
@@ -114,6 +115,13 @@ func (c *HubbleGRPCClient) StreamFlows(ctx context.Context, namespace string) er
 
 			flowCount++
 			c.printFlow(flowCount, response)
+
+			// Print raw flow data for debugging
+			if flowData, err := json.MarshalIndent(response, "", "  "); err == nil {
+				fmt.Printf("RAW FLOW #%d:\n%s\n", flowCount, string(flowData))
+			} else {
+				fmt.Printf("RAW FLOW #%d: %+v\n", flowCount, response)
+			}
 		}
 	}
 }
@@ -266,11 +274,6 @@ func (c *HubbleGRPCClient) StreamFlowsWithDetection(ctx context.Context, namespa
 			if flow != nil {
 				// Process flow with anomaly detection
 				detector.ProcessFlow(ctx, flow)
-			}
-
-			// Print flow info (optional, can be disabled for performance)
-			if flowCount%10 == 0 { // Print every 10th flow to reduce noise
-				c.printFlow(flowCount, response)
 			}
 		}
 	}

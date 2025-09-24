@@ -8,6 +8,7 @@ Một công cụ phát hiện bất thường mạng dựa trên dữ liệu flo
 - **Redis-based Caching**: Sử dụng Redis để lưu trữ và xử lý flow data hiệu quả
 - **Rule Engine**: Hệ thống rule engine với các quy tắc phát hiện bất thường:
   - Traffic spike detection (phát hiện tăng đột biến lưu lượng)
+  - Traffic drop detection (phát hiện service chết/ngừng hoạt động)
   - DDoS pattern detection (phát hiện mẫu DDoS)
   - High error rate detection (phát hiện tỷ lệ lỗi cao)
   - Error burst detection (phát hiện bùng nổ lỗi)
@@ -72,44 +73,107 @@ Redis được cấu hình mặc định với:
 
 ### Cấu hình Rule Engine
 
-Hệ thống rule engine có các rule mặc định:
+Hệ thống rule engine có 4 rules mới:
 
-1. **High Error Rate**
-   - Window: 60 giây
-   - Threshold: 5%
-   - Severity: HIGH
-
-2. **Traffic Spike**
-   - Window: 5 phút
-   - Threshold: 200% tăng so với baseline
-   - Severity: HIGH
-
-3. **Connection Flood (DDoS)**
-   - Window: 10 giây
-   - Threshold: 100 connections
+1. **DDoS Spike Rule**
+   - Window: 5 giây
+   - Threshold: 50 flows
    - Severity: CRITICAL
+   - Mục tiêu: Phát hiện DDoS attacks với >50 flows trong 5 giây
+
+2. **Traffic Drop (Service Down)**
+   - Window: 30 giây
+   - Threshold: 0 flows
+   - Severity: CRITICAL
+   - Mục tiêu: Phát hiện service ngừng nhận request
+
+3. **Port Scan Detection**
+   - Window: 30 giây
+   - Threshold: 20 unique ports
+   - Severity: HIGH
+   - Mục tiêu: Phát hiện 1 pod thử kết nối nhiều cổng khác nhau
+
+4. **Cross-Namespace Traffic**
+   - Window: 60 giây
+   - Threshold: 1 flow
+   - Severity: MEDIUM
+   - Mục tiêu: Phát hiện pod gửi traffic bất thường sang namespace khác
+
+## Cách thức hoạt động của Anomaly Detection
+
+### 1. **Thu thập dữ liệu Flow (Data Collection)**
+```
+Hubble gRPC Stream → FlowCache → Redis Storage
+```
+
+**Dữ liệu được lưu trữ:**
+- **Key format**: `flow:srcPod:dstPod` (ví dụ: `flow:demo-frontend-xxx:demo-api-yyy`)
+- **Value format**: `port|flags|verdict` (ví dụ: `8080|443|SYN,ACK|FORWARDED`)
+- **Timestamp**: Unix timestamp để sắp xếp theo thời gian
+- **TTL**: 10 phút cho mỗi flow key
+- **Simple Counting**: Đếm tất cả flows trong time window (không cần bucket logic)
+
+### 2. **Phân tích theo Time Windows**
+```go
+// Mỗi 5 giây, hệ thống phân tích các window
+func evaluateAllRules() {
+    windows := flowCache.GetFlowWindows(60) // 60 giây window
+    totalRequests := 0
+    for _, window := range windows {
+        totalRequests += window.Count
+    }
+    // Hiển thị: "📊 Status: X total requests in last 60s - Normal"
+}
+```
+
+### 3. **Rule Processing Flow**
+```
+Flow Data → Time Window → Rule Evaluation → Alert Generation
+```
+
+**Ví dụ flow data:**
+```
+flow:demo-frontend:demo-api
+├── 1705123456: 8080|443|SYN,ACK|FORWARDED
+├── 1705123457: 8080|443|ACK|FORWARDED
+└── 1705123458: 8080|443|FIN,ACK|FORWARDED
+```
+
+### 4. **Rule Processing Flow**
+```
+Time Windows → Rule Engine → 4 Detection Rules
+     ↓
+Metrics Calculation → Threshold Check → Alert Generation
+     ↓
+Status Display: "📊 Status: X requests - Normal"
+Alert Display: "🚨 [time] CRITICAL DDoS Attack Detected"
+```
 
 ## Các loại Alert
 
-### TRAFFIC_SPIKE
-- **Mô tả**: Phát hiện tăng đột biến lưu lượng mạng
-- **Severity**: HIGH
-- **Trigger**: Khi lưu lượng tăng > 200% so với baseline
+### DDOS_SPIKE
+- **Mô tả**: Phát hiện tấn công DDoS với >50 flows trong 5 giây
+- **Severity**: CRITICAL
+- **Trigger**: Khi có > 50 flows trong 5 giây
+- **Message**: `"DDoS Attack Detected: X flows in 5s (threshold: 50) - srcPod:dstPod"`
 
-### DDOS_PATTERN
-- **Mô tả**: Phát hiện mẫu tấn công DDoS
-- **Severity**: HIGH
-- **Trigger**: Khi có > 100 connections trong 10 giây
+### TRAFFIC_DROP (Service Down)
+- **Mô tả**: Phát hiện service ngừng hoạt động
+- **Severity**: CRITICAL
+- **Trigger**: Khi không có traffic trong 30 giây
+- **Message**: `"Service Down Detected: No traffic for 30s - srcPod:dstPod"`
 
-### HIGH_ERROR_RATE
-- **Mô tả**: Tỷ lệ lỗi HTTP cao
+### PORT_SCAN
+- **Mô tả**: Phát hiện port scanning với >20 unique ports
 - **Severity**: HIGH
-- **Trigger**: Khi tỷ lệ lỗi > 5%
+- **Trigger**: Khi có > 20 unique ports trong 30 giây
+- **Message**: `"Port Scan Detected: X unique ports in 30s (threshold: 20) - srcPod:dstPod"`
 
-### ERROR_BURST
-- **Mô tả**: Bùng nổ lỗi trong thời gian ngắn
-- **Severity**: HIGH
-- **Trigger**: Khi có > 10 lỗi trong 30 giây
+### CROSS_NAMESPACE
+- **Mô tả**: Phát hiện traffic bất thường sang namespace khác
+- **Severity**: MEDIUM
+- **Trigger**: Khi có traffic sang namespace không được phép
+- **Message**: `"Cross-Namespace Traffic Detected: srcPod (srcNS) -> dstPod (dstNS) - flowKey"`
 
 ## Cấu trúc Project
 
@@ -139,37 +203,40 @@ Hệ thống rule engine có các rule mặc định:
 
 ## Ví dụ Output
 
-### Menu chính
+### Status Display (Normal)
 ```
-==================================================
-📋 MAIN MENU
-==================================================
-1. View Flows - Hiển thị flows real-time
-2. Detect Anomaly - Phát hiện bất thường
-3. Exit - Thoát chương trình
-==================================================
-Chọn option (1-3): 
+📊 Status: 150 total requests in last 60s - Normal
+📊 Status: 200 total requests in last 60s - Normal
 ```
 
-### Anomaly Alert
+### DDoS Spike Alert
 ```
-🚨 ANOMALY DETECTED 🚨
-Type: TRAFFIC_SPIKE
-Severity: HIGH
-Message: Traffic spike detected: Pod frontend -> api: 150000000.00 bytes (baseline: 75000000.00, increase: 200.0%)
-Time: 2024-01-15 10:30:45
-Stats: Flows=1250, Bytes=500000000, Errors=5, Rate=25.00/sec
---------------------------------------------------
+🚨 [2024-01-15 14:30:25] CRITICAL DDoS Attack Detected: 75 flows in 5s (threshold: 50) - demo-frontend-xxx:demo-api-yyy
+   📈 Stats: 75 flows, 15.00 flow/sec, 75 connections
 ```
 
-### Redis Stats
+### Service Down Alert
 ```
-📊 REDIS CACHE STATS
-Flow Keys: 45
-Window Keys: 45
-Buffer Size: 12/1000
-Rules: 3 enabled, 0 disabled
-------------------------------
+🚨 [2024-01-15 14:31:10] CRITICAL Service Down Detected: No traffic for 30s - demo-frontend-xxx:demo-api-yyy
+   📈 Stats: 0 flows, 0.00 flow/sec, 0 connections
+```
+
+### Port Scan Alert
+```
+🔴 [2024-01-15 14:32:05] HIGH Port Scan Detected: 25 unique ports in 30s (threshold: 20) - demo-frontend-xxx:demo-api-yyy
+   📈 Stats: 25 flows, 0.83 flow/sec, 25 connections
+```
+
+### Cross-Namespace Alert
+```
+🟡 [2024-01-15 14:33:00] MEDIUM Cross-Namespace Traffic Detected: demo-frontend-xxx (default) -> demo-api-yyy (kube-system) - flow:demo-frontend-xxx:demo-api-yyy
+   📈 Stats: 1 flows, 0.02 flow/sec, 1 connections
+```
+
+### Status Display (Every 60 seconds)
+```
+📊 Status: 150 total requests in last 60s - Normal
+📊 Status: 200 total requests in last 60s - Normal
 ```
 
 ## Troubleshooting
@@ -240,6 +307,15 @@ docker run -it --rm hubble-anomaly-detector
 5. Tạo Pull Request
 
 ## Changelog
+
+### v2.0.0 - Redesign Anomaly Detection Rules
+- 🎯 **4 Rules mới**: DDoS Spike, Traffic Drop, Port Scan, Cross-Namespace
+- 🗑️ **Xóa bucket logic**: Loại bỏ hoàn toàn bucket-based analysis
+- 🚀 **Đơn giản hóa**: Logic đơn giản hơn, ít false positive
+- 📊 **Status Display**: Hiển thị tổng số request và trạng thái "Normal" mỗi 5 giây
+- 🚨 **Alert Format**: Cải thiện format alert với timestamp, emoji severity và thông tin chi tiết
+- 🔧 **Code Cleanup**: Xóa tất cả functions liên quan đến bucket
+- 📝 **Documentation**: Cập nhật README.md với 4 rules mới
 
 ### v1.1.0 - Tối ưu hóa codebase
 - ✅ Loại bỏ các function không sử dụng
