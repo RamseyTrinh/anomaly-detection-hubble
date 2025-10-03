@@ -3,10 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
+	"github.com/go-redis/redis/v8"
 	"github.com/sirupsen/logrus"
 )
 
@@ -66,45 +66,45 @@ func NewRuleEngine(flowCache *FlowCache, logger *logrus.Logger) *RuleEngine {
 
 // initializeDefaultRules sets up new anomaly detection rules
 func (re *RuleEngine) initializeDefaultRules() {
-	// 1. DDoS Spike Rule: >50 flows trong 5s
+	// 1. DDoS Spike Rule: >20 flows trong 10s
 	re.rules["ddos_spike"] = &RuleConfig{
 		Name:        "DDoS Spike",
 		Enabled:     true,
-		WindowSize:  5,    // 5 seconds
-		Threshold:   50.0, // 50 flows
+		WindowSize:  10,   // 10 seconds
+		Threshold:   20.0, // 20 flows (giảm từ 50 xuống 20)
 		Severity:    "CRITICAL",
-		Description: "Detects DDoS attacks with >50 flows in 5 seconds",
+		Description: "Detects DDoS attacks with >20 flows in 10 seconds",
 	}
 
 	// 2. Traffic Drop Rule: 30s không có traffic
-	re.rules["traffic_drop"] = &RuleConfig{
-		Name:        "Traffic Drop",
-		Enabled:     true,
-		WindowSize:  30,  // 30 seconds
-		Threshold:   0.0, // 0 flows (no traffic)
-		Severity:    "CRITICAL",
-		Description: "Detects service down - no traffic for 30 seconds",
-	}
+	// re.rules["traffic_drop"] = &RuleConfig{
+	// 	Name:        "Traffic Drop",
+	// 	Enabled:     true,
+	// 	WindowSize:  30,  // 30 seconds
+	// 	Threshold:   0.0, // 0 flows (no traffic)
+	// 	Severity:    "CRITICAL",
+	// 	Description: "Detects service down - no traffic for 30 seconds",
+	// }
 
-	// 3. Port Scan Rule: >20 unique ports trong 30s
-	re.rules["port_scan"] = &RuleConfig{
-		Name:        "Port Scan",
-		Enabled:     true,
-		WindowSize:  30,   // 30 seconds
-		Threshold:   20.0, // 20 unique ports
-		Severity:    "HIGH",
-		Description: "Detects port scanning - >20 unique ports in 30 seconds",
-	}
+	// // 3. Port Scan Rule: >20 unique ports trong 30s
+	// re.rules["port_scan"] = &RuleConfig{
+	// 	Name:        "Port Scan",
+	// 	Enabled:     true,
+	// 	WindowSize:  30,   // 30 seconds
+	// 	Threshold:   20.0, // 20 unique ports
+	// 	Severity:    "HIGH",
+	// 	Description: "Detects port scanning - >20 unique ports in 30 seconds",
+	// }
 
-	// 4. Cross-Namespace Rule: traffic sang namespace khác
-	re.rules["cross_namespace"] = &RuleConfig{
-		Name:        "Cross-Namespace",
-		Enabled:     true,
-		WindowSize:  60,  // 60 seconds
-		Threshold:   1.0, // Any cross-namespace traffic
-		Severity:    "MEDIUM",
-		Description: "Detects cross-namespace traffic not in allow-list",
-	}
+	// // 4. Cross-Namespace Rule: traffic sang namespace khác
+	// re.rules["cross_namespace"] = &RuleConfig{
+	// 	Name:        "Cross-Namespace",
+	// 	Enabled:     true,
+	// 	WindowSize:  60,  // 60 seconds
+	// 	Threshold:   1.0, // Any cross-namespace traffic
+	// 	Severity:    "MEDIUM",
+	// 	Description: "Detects cross-namespace traffic not in allow-list",
+	// }
 }
 
 // Start begins the rule engine processing
@@ -143,29 +143,10 @@ func (re *RuleEngine) evaluateAllRules() {
 	re.mu.RLock()
 	defer re.mu.RUnlock()
 
-	windows, err := re.flowCache.GetFlowWindows(60) // 60 second window
-	if err != nil {
-		re.logger.Errorf("Failed to get flow windows: %v", err)
-		return
-	}
-
-	totalRequests := 0
-	for _, window := range windows {
-		totalRequests += window.Count
-	}
-
 	if time.Since(re.lastStatusLog) > 60*time.Second {
-		re.logger.Infof("Status: %d total requests in last 60s - Normal", totalRequests)
+		re.logger.Infof("Status: Evaluating anomaly detection rules - Normal")
 		re.lastStatusLog = time.Now()
-	}
 
-	if len(windows) > 0 {
-		re.logger.Debugf("Analyzing %d flow windows for anomaly detection", len(windows))
-
-		// Debug: In chi tiết các flow windows
-		for i, window := range windows {
-			re.logger.Debugf("   Window %d: %s (%d flows)", i+1, window.Key, window.Count)
-		}
 	}
 
 	enabledCount := 0
@@ -187,52 +168,32 @@ func (re *RuleEngine) evaluateAllRules() {
 
 // evaluateRule evaluates a specific rule and returns true if any alerts were triggered
 func (re *RuleEngine) evaluateRule(ruleName string, config *RuleConfig) bool {
-	// Get flow windows from Redis
-	windows, err := re.flowCache.GetFlowWindows(config.WindowSize)
-	if err != nil {
-		re.logger.Errorf("Failed to get flow windows for rule %s: %v", ruleName, err)
-		return false
+	// Evaluate rule directly without flow windows
+	result := re.runRuleDirect(ruleName, config)
+	if result.Triggered {
+		re.handleRuleResult(result)
+		return true
 	}
-
-	alertTriggered := false
-	// Evaluate rule for each window
-	for _, window := range windows {
-		result := re.runRule(ruleName, config, window)
-		if result.Triggered {
-			re.handleRuleResult(result)
-			alertTriggered = true
-		}
-	}
-
-	return alertTriggered
+	return false
 }
 
-// runRule executes a specific rule against a flow window
-func (re *RuleEngine) runRule(ruleName string, config *RuleConfig, window *FlowWindow) *RuleResult {
+// runRuleDirect executes a specific rule directly against Redis data
+func (re *RuleEngine) runRuleDirect(ruleName string, config *RuleConfig) *RuleResult {
 	result := &RuleResult{
 		RuleName:  ruleName,
 		Timestamp: time.Now(),
 		Details:   make(map[string]interface{}),
 	}
 
-	// Get metrics for this window
-	metrics, err := re.flowCache.GetFlowMetrics(window.Key, config.WindowSize)
-	if err != nil {
-		re.logger.Errorf("Failed to get metrics for rule %s: %v", ruleName, err)
-		return result
-	}
-
-	result.Metrics = metrics
-
 	switch ruleName {
 	case "ddos_spike":
-		result = re.checkDDoSSpike(config, metrics, result)
-	case "traffic_drop":
-		result = re.checkTrafficDrop(config, metrics, result)
-	case "port_scan":
-		result = re.checkPortScan(config, metrics, result)
-	case "cross_namespace":
-		result = re.checkCrossNamespace(config, metrics, result)
+		result = re.checkDDoSSpikeDirect(config, result)
+	// case "traffic_drop":
+	// 	result = re.checkTrafficDropDirect(config, result)
+	// case "port_scan":
+	// 	result = re.checkPortScanDirect(config, result)
+	// case "cross_namespace":
+	// 	result = re.checkCrossNamespaceDirect(config, result)
 	default:
 		re.logger.Warnf("Unknown rule: %s", ruleName)
 	}
@@ -240,91 +201,192 @@ func (re *RuleEngine) runRule(ruleName string, config *RuleConfig, window *FlowW
 	return result
 }
 
-// checkDDoSSpike checks for DDoS attacks with >50 flows in 5 seconds
-func (re *RuleEngine) checkDDoSSpike(config *RuleConfig, metrics *FlowMetrics, result *RuleResult) *RuleResult {
-	if metrics.TotalFlows > int64(config.Threshold) {
+// checkDDoSSpikeDirect checks for DDoS attacks using direct Redis queries
+func (re *RuleEngine) checkDDoSSpikeDirect(config *RuleConfig, result *RuleResult) *RuleResult {
+	// Get all flows from the time window
+	now := time.Now().Unix()
+	windowStart := now - config.WindowSize
+
+	flows, err := re.flowCache.client.ZRangeByScoreWithScores(re.flowCache.ctx, "flows", &redis.ZRangeBy{
+		Min: fmt.Sprintf("%d", windowStart),
+		Max: fmt.Sprintf("%d", now),
+	}).Result()
+	if err != nil {
+		re.logger.Errorf("Failed to get flows for DDoS detection: %v", err)
+		return result
+	}
+
+	totalFlows := len(flows)
+	// re.logger.Debugf("🔍 DDoS Detection: Found %d total flows in time window", totalFlows)
+
+	if int64(totalFlows) > int64(config.Threshold) {
+		re.logger.Warnf("🚨 DDoS Attack Detected: %d total flows in %ds (threshold: %.0f)",
+			totalFlows, config.WindowSize, config.Threshold)
 		result.Triggered = true
 		result.Severity = config.Severity
-		result.Message = fmt.Sprintf("DDoS Attack Detected: %d flows in %ds (threshold: %.0f) - %s",
-			metrics.TotalFlows, config.WindowSize, config.Threshold, metrics.Key)
-		result.Details["total_flows"] = metrics.TotalFlows
+		result.Message = fmt.Sprintf("DDoS Attack Detected: %d total flows in %ds (threshold: %.0f)",
+			totalFlows, config.WindowSize, config.Threshold)
+		result.Details["total_flows"] = totalFlows
 		result.Details["window_duration"] = config.WindowSize
 		result.Details["threshold"] = config.Threshold
-	}
-	return result
-}
-
-// checkTrafficDrop checks for service down - no traffic for 30 seconds
-func (re *RuleEngine) checkTrafficDrop(config *RuleConfig, metrics *FlowMetrics, result *RuleResult) *RuleResult {
-	if metrics.TotalFlows == 0 {
-		result.Triggered = true
-		result.Severity = config.Severity
-		result.Message = fmt.Sprintf("Service Down Detected: No traffic for %ds - %s",
-			config.WindowSize, metrics.Key)
-		result.Details["total_flows"] = metrics.TotalFlows
-		result.Details["window_duration"] = config.WindowSize
-		result.Details["service_status"] = "DOWN"
-	}
-	return result
-}
-
-// checkPortScan checks for port scanning - >20 unique ports in 30 seconds
-func (re *RuleEngine) checkPortScan(config *RuleConfig, metrics *FlowMetrics, result *RuleResult) *RuleResult {
-	// Get unique ports for this source in the time window
-	uniquePorts, err := re.flowCache.GetUniquePortsForSource(metrics.Key, config.WindowSize)
-	if err != nil {
-		re.logger.Errorf("Failed to get unique ports for port scan check: %v", err)
 		return result
 	}
 
-	if len(uniquePorts) > int(config.Threshold) {
-		result.Triggered = true
-		result.Severity = config.Severity
-		result.Message = fmt.Sprintf("Port Scan Detected: %d unique ports in %ds (threshold: %.0f) - %s",
-			len(uniquePorts), config.WindowSize, config.Threshold, metrics.Key)
-		result.Details["unique_ports"] = len(uniquePorts)
-		result.Details["window_duration"] = config.WindowSize
-		result.Details["threshold"] = config.Threshold
-		result.Details["ports"] = uniquePorts
-	}
-	return result
-}
-
-// checkCrossNamespace checks for cross-namespace traffic not in allow-list
-func (re *RuleEngine) checkCrossNamespace(config *RuleConfig, metrics *FlowMetrics, result *RuleResult) *RuleResult {
-	// Extract namespace information from the key
-	// Key format: flow:srcPod:dstPod
-	keyParts := strings.Split(metrics.Key, ":")
-	if len(keyParts) < 3 {
-		re.logger.Warnf("Invalid flow key format for cross-namespace check: %s", metrics.Key)
-		return result
-	}
-
-	srcPod := keyParts[1]
-	dstPod := keyParts[2]
-
-	// Get namespace information for source and destination pods
-	srcNamespace, dstNamespace, err := re.flowCache.GetPodNamespaces(srcPod, dstPod)
-	if err != nil {
-		re.logger.Errorf("Failed to get pod namespaces: %v", err)
-		return result
-	}
-
-	// Check if this is cross-namespace traffic
-	if srcNamespace != dstNamespace {
-		// Check if this cross-namespace traffic is allowed
-		if !re.isCrossNamespaceAllowed(srcNamespace, dstNamespace) {
-			result.Triggered = true
-			result.Severity = config.Severity
-			result.Message = fmt.Sprintf("Cross-Namespace Traffic Detected: %s (%s) -> %s (%s) - %s",
-				srcPod, srcNamespace, dstPod, dstNamespace, metrics.Key)
-			result.Details["src_pod"] = srcPod
-			result.Details["src_namespace"] = srcNamespace
-			result.Details["dst_pod"] = dstPod
-			result.Details["dst_namespace"] = dstNamespace
-			result.Details["traffic_type"] = "CROSS_NAMESPACE"
+	// Also check per source IP for detailed analysis
+	srcIPCounts := make(map[string]int64)
+	for _, flow := range flows {
+		srcIP, _, _, _, _ := re.flowCache.parseFlowMember(flow.Member.(string))
+		if srcIP != "unknown" {
+			srcIPCounts[srcIP]++
 		}
 	}
+
+	return result
+}
+
+// checkTrafficDropDirect checks for service down using direct Redis queries
+func (re *RuleEngine) checkTrafficDropDirect(config *RuleConfig, result *RuleResult) *RuleResult {
+	// Get all unique destination IPs and namespaces from the time window
+	now := time.Now().Unix()
+	windowStart := now - config.WindowSize
+
+	flows, err := re.flowCache.client.ZRangeByScoreWithScores(re.flowCache.ctx, "flows", &redis.ZRangeBy{
+		Min: fmt.Sprintf("%d", windowStart),
+		Max: fmt.Sprintf("%d", now),
+	}).Result()
+	if err != nil {
+		re.logger.Errorf("Failed to get flows for traffic drop detection: %v", err)
+		return result
+	}
+
+	// Count flows per destination IP and namespace
+	dstIPCounts := make(map[string]int64)
+	dstNSCounts := make(map[string]int64)
+
+	for _, flow := range flows {
+		_, dstIP, _, dstNS, _ := re.flowCache.parseFlowMember(flow.Member.(string))
+		if dstIP != "unknown" {
+			dstIPCounts[dstIP]++
+		}
+		if dstNS != "unknown" {
+			dstNSCounts[dstNS]++
+		}
+	}
+
+	// Check for services with no traffic
+	for dstIP, count := range dstIPCounts {
+		if count == 0 {
+			result.Triggered = true
+			result.Severity = config.Severity
+			result.Message = fmt.Sprintf("Service Down Detected: No traffic to %s for %ds",
+				dstIP, config.WindowSize)
+			result.Details["dst_ip"] = dstIP
+			result.Details["total_flows"] = count
+			result.Details["window_duration"] = config.WindowSize
+			result.Details["service_status"] = "DOWN"
+			break
+		}
+	}
+
+	// Also check namespaces
+	for dstNS, count := range dstNSCounts {
+		if count == 0 {
+			result.Triggered = true
+			result.Severity = config.Severity
+			result.Message = fmt.Sprintf("Namespace Down Detected: No traffic to %s namespace for %ds",
+				dstNS, config.WindowSize)
+			result.Details["dst_namespace"] = dstNS
+			result.Details["total_flows"] = count
+			result.Details["window_duration"] = config.WindowSize
+			result.Details["service_status"] = "DOWN"
+			break
+		}
+	}
+
+	return result
+}
+
+// checkPortScanDirect checks for port scanning using direct Redis queries
+func (re *RuleEngine) checkPortScanDirect(config *RuleConfig, result *RuleResult) *RuleResult {
+	// Get all unique source IPs from the time window
+	now := time.Now().Unix()
+	windowStart := now - config.WindowSize
+
+	flows, err := re.flowCache.client.ZRangeByScoreWithScores(re.flowCache.ctx, "flows", &redis.ZRangeBy{
+		Min: fmt.Sprintf("%d", windowStart),
+		Max: fmt.Sprintf("%d", now),
+	}).Result()
+	if err != nil {
+		re.logger.Errorf("Failed to get flows for port scan detection: %v", err)
+		return result
+	}
+
+	// Group flows by source IP and count unique destination ports
+	srcIPPorts := make(map[string]map[string]bool)
+	for _, flow := range flows {
+		srcIP, _, _, _, dstPort := re.flowCache.parseFlowMember(flow.Member.(string))
+		if srcIP != "unknown" && dstPort != "0" {
+			if srcIPPorts[srcIP] == nil {
+				srcIPPorts[srcIP] = make(map[string]bool)
+			}
+			srcIPPorts[srcIP][dstPort] = true
+		}
+	}
+
+	// Check each source IP for port scan threshold
+	for srcIP, ports := range srcIPPorts {
+		uniquePortCount := len(ports)
+		if uniquePortCount > int(config.Threshold) {
+			result.Triggered = true
+			result.Severity = config.Severity
+			result.Message = fmt.Sprintf("Port Scan Detected: %d unique ports from %s in %ds (threshold: %.0f)",
+				uniquePortCount, srcIP, config.WindowSize, config.Threshold)
+
+			// Convert map to slice for details
+			var portList []string
+			for port := range ports {
+				portList = append(portList, port)
+			}
+
+			result.Details["src_ip"] = srcIP
+			result.Details["unique_ports"] = uniquePortCount
+			result.Details["window_duration"] = config.WindowSize
+			result.Details["threshold"] = config.Threshold
+			result.Details["ports"] = portList
+			break // Alert on first detected port scan
+		}
+	}
+
+	return result
+}
+
+// checkCrossNamespaceDirect checks for cross-namespace traffic using direct Redis queries
+func (re *RuleEngine) checkCrossNamespaceDirect(config *RuleConfig, result *RuleResult) *RuleResult {
+	// Get cross-namespace flows from the time window
+	crossNamespaceFlows, err := re.flowCache.GetCrossNamespaceFlows(config.WindowSize)
+	if err != nil {
+		re.logger.Errorf("Failed to get cross-namespace flows: %v", err)
+		return result
+	}
+
+	// Check each cross-namespace flow against allow-list
+	for _, flow := range crossNamespaceFlows {
+		if !re.isCrossNamespaceAllowed(flow.SrcNS, flow.DstNS) {
+			result.Triggered = true
+			result.Severity = config.Severity
+			result.Message = fmt.Sprintf("Cross-Namespace Traffic Detected: %s (%s) -> %s (%s) on port %s",
+				flow.SrcIP, flow.SrcNS, flow.DstIP, flow.DstNS, flow.DstPort)
+			result.Details["src_ip"] = flow.SrcIP
+			result.Details["src_namespace"] = flow.SrcNS
+			result.Details["dst_ip"] = flow.DstIP
+			result.Details["dst_namespace"] = flow.DstNS
+			result.Details["dst_port"] = flow.DstPort
+			result.Details["timestamp"] = flow.Timestamp
+			result.Details["traffic_type"] = "CROSS_NAMESPACE"
+			break // Alert on first detected cross-namespace violation
+		}
+	}
+
 	return result
 }
 
@@ -359,14 +421,14 @@ func (re *RuleEngine) handleRuleResult(result *RuleResult) {
 		Message:   result.Message,
 		Timestamp: result.Timestamp,
 		Stats: &FlowStats{
-			TotalFlows:       result.Metrics.TotalFlows,
-			TotalBytes:       result.Metrics.TotalBytes,
-			TotalConnections: result.Metrics.ConnectionCount,
-			DroppedPackets:   result.Metrics.ErrorCount,
-			FlowRate:         result.Metrics.FlowRate,
-			ByteRate:         result.Metrics.ByteRate,
-			ConnectionRate:   float64(result.Metrics.ConnectionCount) / float64(result.Metrics.WindowDuration),
-			DropRate:         result.Metrics.ErrorRate,
+			TotalFlows:       0, // Not available in simplified detection
+			TotalBytes:       0, // Not available in simplified detection
+			TotalConnections: 0, // Not available in simplified detection
+			DroppedPackets:   0, // Not available in simplified detection
+			FlowRate:         0, // Not available in simplified detection
+			ByteRate:         0, // Not available in simplified detection
+			ConnectionRate:   0, // Not available in simplified detection
+			DropRate:         0, // Not available in simplified detection
 		},
 	}
 

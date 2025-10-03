@@ -145,8 +145,6 @@ func (ad *AnomalyDetector) calculateBytes(f *Flow) int64 {
 	return 0
 }
 
-// Legacy detection functions removed - using rule engine instead
-
 // sendAlert sends an alert to the alert channel
 func (ad *AnomalyDetector) sendAlert(alert Alert) {
 	select {
@@ -192,4 +190,9 @@ func (ad *AnomalyDetector) GetRuleEngineAlertChannel() <-chan Alert {
 		return nil
 	}
 	return ad.ruleEngine.GetAlertChannel()
+}
+
+// GetFlowCache returns the flow cache instance
+func (ad *AnomalyDetector) GetFlowCache() *FlowCache {
+	return ad.flowCache
 }

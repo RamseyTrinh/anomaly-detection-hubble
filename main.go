@@ -107,8 +107,8 @@ func viewFlows(client *HubbleGRPCClient, namespace string) {
 		cancel()
 	}()
 
-	// Stream flows
-	if err := client.StreamFlows(ctx, namespace); err != nil {
+	// Stream flows (view only, no Redis)
+	if err := client.StreamFlowsViewOnly(ctx, namespace); err != nil {
 		if err == context.Canceled {
 			fmt.Println("Flow viewing stopped")
 		} else {
@@ -161,8 +161,6 @@ func detectAnomaly(client *HubbleGRPCClient, namespace string) {
 			case alert := <-alertChannel:
 				fmt.Printf("\nALERT: [%s] %s - %s\n", alert.Severity, alert.Type, alert.Message)
 				if alert.Stats != nil {
-					fmt.Printf("   📊 Stats: %d flows, %d connections, %.2f flow/sec\n",
-						alert.Stats.TotalFlows, alert.Stats.TotalConnections, alert.Stats.FlowRate)
 				}
 			case <-ctx.Done():
 				return
@@ -189,12 +187,18 @@ func detectAnomaly(client *HubbleGRPCClient, namespace string) {
 	fmt.Println("📊 Monitoring flows and detecting anomalies...")
 	fmt.Println("")
 
-	// Stream flows with anomaly detection
-	if err := client.StreamFlowsWithDetection(ctx, namespace, detector); err != nil {
-		if err == context.Canceled {
-			fmt.Println("Anomaly detection stopped")
-		} else {
-			fmt.Printf("Anomaly detection failed: %v\n", err)
+	// Start streaming flows to Redis (separate from detection)
+	go func() {
+		if err := client.StreamFlows(ctx, namespace, detector.GetFlowCache()); err != nil {
+			if err == context.Canceled {
+				fmt.Println("Flow streaming stopped")
+			} else {
+				fmt.Printf("Flow streaming failed: %v\n", err)
+			}
 		}
-	}
+	}()
+
+	// Wait for context to be cancelled
+	<-ctx.Done()
+	fmt.Println("Anomaly detection stopped")
 }

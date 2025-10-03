@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
@@ -43,7 +42,7 @@ func (c *HubbleGRPCClient) TestConnection(ctx context.Context) error {
 	// Simple connection test
 	state := c.conn.GetState()
 	if state.String() == "READY" {
-		fmt.Printf("✅ Successfully connected to Hubble relay at %s\n", c.server)
+		fmt.Printf("Successfully connected to Hubble relay at %s\n", c.server)
 		return nil
 	}
 
@@ -53,15 +52,15 @@ func (c *HubbleGRPCClient) TestConnection(ctx context.Context) error {
 
 	ready := c.conn.WaitForStateChange(ctx, state)
 	if ready {
-		fmt.Printf("✅ Successfully connected to Hubble relay at %s\n", c.server)
+		fmt.Printf("Successfully connected to Hubble relay at %s\n", c.server)
 		return nil
 	}
 
 	return fmt.Errorf("connection test failed: connection not ready")
 }
 
-// StreamFlows streams flows from Hubble and prints them
-func (c *HubbleGRPCClient) StreamFlows(ctx context.Context, namespace string) error {
+// StreamFlows streams flows from Hubble and saves them to Redis
+func (c *HubbleGRPCClient) StreamFlows(ctx context.Context, namespace string, flowCache *FlowCache) error {
 	fmt.Println("🚀 Starting to stream flows from Hubble relay...")
 	if namespace != "" {
 		fmt.Printf("📋 Filtering flows for namespace: %s\n", namespace)
@@ -69,15 +68,12 @@ func (c *HubbleGRPCClient) StreamFlows(ctx context.Context, namespace string) er
 	fmt.Println("Press Ctrl+C to stop")
 	fmt.Println(strings.Repeat("=", 80))
 
-	// Create Hubble observer client
 	client := observer.NewObserverClient(c.conn)
 
-	// Create flow request for streaming
 	req := &observer.GetFlowsRequest{
 		Follow: true, // Stream flows continuously
 	}
 
-	// Add namespace filter if specified
 	if namespace != "" {
 		req.Whitelist = []*observer.FlowFilter{
 			{
@@ -89,7 +85,6 @@ func (c *HubbleGRPCClient) StreamFlows(ctx context.Context, namespace string) er
 		}
 	}
 
-	// Start streaming flows
 	stream, err := client.GetFlows(ctx, req)
 	if err != nil {
 		return fmt.Errorf("failed to start flow streaming: %v", err)
@@ -100,13 +95,13 @@ func (c *HubbleGRPCClient) StreamFlows(ctx context.Context, namespace string) er
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Println("\nStopped streaming flows")
+			fmt.Println("\n🛑 Stopped streaming flows")
 			return nil
 		default:
 			// Receive flow from stream
 			response, err := stream.Recv()
 			if err == io.EOF {
-				fmt.Println("Stream ended")
+				fmt.Println("🛑 Stream ended")
 				return nil
 			}
 			if err != nil {
@@ -114,30 +109,34 @@ func (c *HubbleGRPCClient) StreamFlows(ctx context.Context, namespace string) er
 			}
 
 			flowCount++
-			c.printFlow(flowCount, response)
 
-			// Print raw flow data for debugging
-			if flowData, err := json.MarshalIndent(response, "", "  "); err == nil {
-				fmt.Printf("RAW FLOW #%d:\n%s\n", flowCount, string(flowData))
-			} else {
-				fmt.Printf("RAW FLOW #%d: %+v\n", flowCount, response)
+			// Convert Hubble flow to our Flow struct and save to Redis
+			flow := c.convertHubbleFlow(response.GetFlow())
+			if flow != nil && flowCache != nil {
+				flowCache.AddFlow(flow)
+				fmt.Printf("💾 Saved flow #%d to Redis\n", flowCount)
 			}
+
+			// Also print flow details for viewing
+			c.printFlow(flowCount, response)
 		}
 	}
 }
 
-// printFlow prints a real flow from Hubble gRPC response
+// StreamFlowsViewOnly streams flows from Hubble and only prints them (no Redis)
+func (c *HubbleGRPCClient) StreamFlowsViewOnly(ctx context.Context, namespace string) error {
+	return c.StreamFlows(ctx, namespace, nil)
+}
+
 func (c *HubbleGRPCClient) printFlow(flowCount int, response *observer.GetFlowsResponse) {
 	flow := response.GetFlow()
 	if flow == nil {
 		return
 	}
 
-	// Extract basic flow information
 	timeStr := flow.GetTime().AsTime().Format("2006-01-02 15:04:05")
 	verdict := flow.GetVerdict().String()
 
-	// Extract IP information
 	sourceIP := "unknown"
 	destIP := "unknown"
 	if flow.GetIP() != nil {
@@ -145,7 +144,6 @@ func (c *HubbleGRPCClient) printFlow(flowCount int, response *observer.GetFlowsR
 		destIP = flow.GetIP().GetDestination()
 	}
 
-	// Extract port information
 	sourcePort := "unknown"
 	destPort := "unknown"
 	if flow.GetL4() != nil {
@@ -158,7 +156,6 @@ func (c *HubbleGRPCClient) printFlow(flowCount int, response *observer.GetFlowsR
 		}
 	}
 
-	// Extract source endpoint information
 	sourceInfo := fmt.Sprintf("%s:%s", sourceIP, sourcePort)
 	if source := flow.GetSource(); source != nil {
 		if source.GetNamespace() != "" {
@@ -169,7 +166,6 @@ func (c *HubbleGRPCClient) printFlow(flowCount int, response *observer.GetFlowsR
 		}
 	}
 
-	// Extract destination endpoint information
 	destInfo := fmt.Sprintf("%s:%s", destIP, destPort)
 	if destination := flow.GetDestination(); destination != nil {
 		if destination.GetNamespace() != "" {
@@ -180,7 +176,6 @@ func (c *HubbleGRPCClient) printFlow(flowCount int, response *observer.GetFlowsR
 		}
 	}
 
-	// Extract TCP flags
 	tcpFlags := ""
 	if flow.GetL4() != nil {
 		if tcp := flow.GetL4().GetTCP(); tcp != nil && tcp.GetFlags() != nil {
@@ -209,7 +204,6 @@ func (c *HubbleGRPCClient) printFlow(flowCount int, response *observer.GetFlowsR
 		}
 	}
 
-	// Print flow information
 	fmt.Printf("Flow #%d: %s\n", flowCount, timeStr)
 	fmt.Printf("  Source: %s\n", sourceInfo)
 	fmt.Printf("  Destination: %s\n", destInfo)
@@ -221,17 +215,14 @@ func (c *HubbleGRPCClient) printFlow(flowCount int, response *observer.GetFlowsR
 	fmt.Println("  " + strings.Repeat("-", 50))
 }
 
-// StreamFlowsWithDetection streams flows and processes them with anomaly detection
 func (c *HubbleGRPCClient) StreamFlowsWithDetection(ctx context.Context, namespace string, detector *AnomalyDetector) error {
 	// Create Hubble observer client
 	client := observer.NewObserverClient(c.conn)
 
-	// Create request to get flows
 	req := &observer.GetFlowsRequest{
 		Follow: true, // Stream flows continuously
 	}
 
-	// Add namespace filter if specified
 	if namespace != "" {
 		req.Whitelist = []*observer.FlowFilter{
 			{
@@ -243,7 +234,6 @@ func (c *HubbleGRPCClient) StreamFlowsWithDetection(ctx context.Context, namespa
 		}
 	}
 
-	// Start streaming flows
 	stream, err := client.GetFlows(ctx, req)
 	if err != nil {
 		return fmt.Errorf("failed to start flow streaming: %v", err)
@@ -254,13 +244,12 @@ func (c *HubbleGRPCClient) StreamFlowsWithDetection(ctx context.Context, namespa
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Println("\n🛑 Stopped streaming flows")
+			fmt.Println("\nStopped streaming flows")
 			return nil
 		default:
-			// Receive flow from stream
 			response, err := stream.Recv()
 			if err == io.EOF {
-				fmt.Println("🛑 Stream ended")
+				fmt.Println("Stream ended")
 				return nil
 			}
 			if err != nil {
@@ -269,17 +258,14 @@ func (c *HubbleGRPCClient) StreamFlowsWithDetection(ctx context.Context, namespa
 
 			flowCount++
 
-			// Convert Hubble flow to our Flow struct
 			flow := c.convertHubbleFlow(response.GetFlow())
 			if flow != nil {
-				// Process flow with anomaly detection
 				detector.ProcessFlow(ctx, flow)
 			}
 		}
 	}
 }
 
-// convertHubbleFlow converts Hubble flow to our Flow struct
 func (c *HubbleGRPCClient) convertHubbleFlow(hubbleFlow *observer.Flow) *Flow {
 	if hubbleFlow == nil {
 		return nil
@@ -287,13 +273,11 @@ func (c *HubbleGRPCClient) convertHubbleFlow(hubbleFlow *observer.Flow) *Flow {
 
 	flow := &Flow{}
 
-	// Convert time
 	if hubbleFlow.Time != nil {
 		t := hubbleFlow.Time.AsTime()
 		flow.Time = &t
 	}
 
-	// Convert verdict
 	switch hubbleFlow.Verdict {
 	case observer.Verdict_FORWARDED:
 		flow.Verdict = Verdict_FORWARDED
@@ -305,7 +289,6 @@ func (c *HubbleGRPCClient) convertHubbleFlow(hubbleFlow *observer.Flow) *Flow {
 		flow.Verdict = Verdict_VERDICT_UNKNOWN
 	}
 
-	// Convert IP information
 	if hubbleFlow.GetIP() != nil {
 		flow.IP = &IP{
 			Source:      hubbleFlow.GetIP().GetSource(),
@@ -313,7 +296,6 @@ func (c *HubbleGRPCClient) convertHubbleFlow(hubbleFlow *observer.Flow) *Flow {
 		}
 	}
 
-	// Convert L4 information
 	if hubbleFlow.GetL4() != nil {
 		flow.L4 = &L4{}
 
@@ -321,7 +303,7 @@ func (c *HubbleGRPCClient) convertHubbleFlow(hubbleFlow *observer.Flow) *Flow {
 			flow.L4.TCP = &TCP{
 				SourcePort:      tcp.GetSourcePort(),
 				DestinationPort: tcp.GetDestinationPort(),
-				Bytes:           0, // Bytes not available in TCP struct
+				Bytes:           0,
 			}
 
 			if flags := tcp.GetFlags(); flags != nil {
@@ -340,7 +322,7 @@ func (c *HubbleGRPCClient) convertHubbleFlow(hubbleFlow *observer.Flow) *Flow {
 			flow.L4.UDP = &UDP{
 				SourcePort:      udp.GetSourcePort(),
 				DestinationPort: udp.GetDestinationPort(),
-				Bytes:           0, // Bytes not available in UDP struct
+				Bytes:           0,
 			}
 		}
 	}
@@ -349,7 +331,6 @@ func (c *HubbleGRPCClient) convertHubbleFlow(hubbleFlow *observer.Flow) *Flow {
 	if hubbleFlow.GetL7() != nil {
 		flow.L7 = &L7{}
 
-		// Map L7 type to our constants
 		l7Type := hubbleFlow.GetL7().GetType()
 		switch l7Type {
 		case 1: // HTTP
@@ -363,7 +344,6 @@ func (c *HubbleGRPCClient) convertHubbleFlow(hubbleFlow *observer.Flow) *Flow {
 		}
 	}
 
-	// Convert flow type
 	switch hubbleFlow.GetType() {
 	case observer.FlowType_L3_L4:
 		flow.Type = FlowType_L3_L4
@@ -373,9 +353,7 @@ func (c *HubbleGRPCClient) convertHubbleFlow(hubbleFlow *observer.Flow) *Flow {
 		flow.Type = FlowType_UNKNOWN_TYPE
 	}
 
-	// Convert source endpoint
 	if source := hubbleFlow.GetSource(); source != nil {
-		// Convert labels from []string to map[string]string
 		labels := make(map[string]string)
 		if sourceLabels := source.GetLabels(); sourceLabels != nil {
 			for _, label := range sourceLabels {
@@ -389,15 +367,14 @@ func (c *HubbleGRPCClient) convertHubbleFlow(hubbleFlow *observer.Flow) *Flow {
 		flow.Source = &Endpoint{
 			Namespace:   source.GetNamespace(),
 			PodName:     source.GetPodName(),
-			ServiceName: "", // ServiceName not available in Hubble flow
-			Workload:    "", // Workload not available in Hubble flow
+			ServiceName: "",
+			Workload:    "",
 			Labels:      labels,
 		}
 	}
 
 	// Convert destination endpoint
 	if dest := hubbleFlow.GetDestination(); dest != nil {
-		// Convert labels from []string to map[string]string
 		labels := make(map[string]string)
 		if destLabels := dest.GetLabels(); destLabels != nil {
 			for _, label := range destLabels {
