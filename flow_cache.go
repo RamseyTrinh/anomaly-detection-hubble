@@ -92,21 +92,18 @@ func NewFlowCache(logger *logrus.Logger) (*FlowCache, error) {
 	go fc.flowProcessor()
 	go fc.cleanupWorker()
 
-	logger.Info("FlowCache initialized with Redis connection")
 	return fc, nil
 }
 
-// AddFlow adds a flow to the cache buffer
 func (fc *FlowCache) AddFlow(flow *Flow) {
 	select {
 	case fc.flowBuffer <- flow:
-		// Flow added to buffer successfully
+
 	default:
 		fc.logger.Warn("Flow buffer is full, dropping flow")
 	}
 }
 
-// flowProcessor processes flows from the buffer and stores them in Redis
 func (fc *FlowCache) flowProcessor() {
 	for {
 		select {

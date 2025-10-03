@@ -30,15 +30,15 @@ func main() {
 	// Set default namespace
 	namespace := "default"
 
-	fmt.Println("🔍 Hubble Anomaly Detector")
+	fmt.Println("Hubble Anomaly Detector")
 	fmt.Printf("Connecting to Hubble relay at: %s\n", *hubbleServer)
-	fmt.Printf("📋 Using namespace: %s\n", namespace)
+	fmt.Printf("Using namespace: %s\n", namespace)
 	fmt.Println("")
 
 	// Create gRPC client
 	client, err := NewHubbleGRPCClient(*hubbleServer)
 	if err != nil {
-		fmt.Printf("❌ Failed to create client: %v\n", err)
+		fmt.Printf("Failed to create client: %v\n", err)
 		os.Exit(1)
 	}
 	defer client.Close()
@@ -46,7 +46,7 @@ func main() {
 	// Test connection
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	if err := client.TestConnection(ctx); err != nil {
-		fmt.Printf("❌ Connection test failed: %v\n", err)
+		fmt.Printf("Connection test failed: %v\n", err)
 		os.Exit(1)
 	}
 	cancel()
@@ -61,16 +61,16 @@ func showMenu(client *HubbleGRPCClient, namespace string) {
 
 	for {
 		fmt.Println("\n" + strings.Repeat("=", 50))
-		fmt.Println("📋 MAIN MENU")
+		fmt.Println("MAIN MENU")
 		fmt.Println(strings.Repeat("=", 50))
-		fmt.Println("1. View Flows - Hiển thị flows real-time")
-		fmt.Println("2. Detect Anomaly - Phát hiện bất thường")
-		fmt.Println("3. Exit - Thoát chương trình")
+		fmt.Println("1. View Flows")
+		fmt.Println("2. Detect Anomaly ")
+		fmt.Println("3. Exit")
 		fmt.Println(strings.Repeat("=", 50))
 		fmt.Print("Chọn option (1-3): ")
 
 		input, _ := reader.ReadString('\n')
-		choice := input[:len(input)-1] // Remove newline
+		choice := input[:len(input)-1]
 
 		switch choice {
 		case "1":
@@ -78,17 +78,17 @@ func showMenu(client *HubbleGRPCClient, namespace string) {
 		case "2":
 			detectAnomaly(client, namespace)
 		case "3":
-			fmt.Println("👋 Goodbye!")
+			fmt.Println("Goodbye!")
 			return
 		default:
-			fmt.Println("❌ Lựa chọn không hợp lệ. Vui lòng chọn 1, 2, hoặc 3.")
+			fmt.Println("Lựa chọn không hợp lệ. Vui lòng chọn 1, 2, hoặc 3.")
 		}
 	}
 }
 
 // viewFlows handles the flow viewing functionality
 func viewFlows(client *HubbleGRPCClient, namespace string) {
-	fmt.Println("\n🔍 VIEWING FLOWS")
+	fmt.Println("\nVIEWING FLOWS")
 	fmt.Println("Press Ctrl+C to return to main menu")
 	fmt.Println("")
 
@@ -103,40 +103,38 @@ func viewFlows(client *HubbleGRPCClient, namespace string) {
 	// Handle shutdown signals
 	go func() {
 		<-sigChan
-		fmt.Println("\n🛑 Returning to main menu...")
+		fmt.Println("\nReturning to main menu...")
 		cancel()
 	}()
 
 	// Stream flows
 	if err := client.StreamFlows(ctx, namespace); err != nil {
 		if err == context.Canceled {
-			fmt.Println("✅ Flow viewing stopped")
+			fmt.Println("Flow viewing stopped")
 		} else {
-			fmt.Printf("❌ Flow streaming failed: %v\n", err)
+			fmt.Printf("Flow streaming failed: %v\n", err)
 		}
 	}
 }
 
 // detectAnomaly handles the anomaly detection functionality
 func detectAnomaly(client *HubbleGRPCClient, namespace string) {
-	fmt.Println("\n🚨 ANOMALY DETECTION")
+	fmt.Println("\nANOMALY DETECTION")
 	fmt.Println("Connecting to Redis and starting anomaly detection...")
 	fmt.Println("Press Ctrl+C to return to main menu")
 	fmt.Println("")
 
 	// Create logger
 	logger := logrus.New()
-	logger.SetLevel(logrus.DebugLevel) // Enable debug logs
+	logger.SetLevel(logrus.DebugLevel)
 
 	// Create config
-	config := &Config{
-		// Add your config here if needed
-	}
+	config := &Config{}
 
 	// Initialize anomaly detector with Redis
 	detector, err := NewAnomalyDetector(config, logger)
 	if err != nil {
-		fmt.Printf("❌ Failed to initialize anomaly detector: %v\n", err)
+		fmt.Printf("Failed to initialize anomaly detector: %v\n", err)
 		return
 	}
 	defer detector.Close()
@@ -152,17 +150,16 @@ func detectAnomaly(client *HubbleGRPCClient, namespace string) {
 	// Handle shutdown signals
 	go func() {
 		<-sigChan
-		fmt.Println("\n🛑 Stopping anomaly detection...")
+		fmt.Println("\nStopping anomaly detection...")
 		cancel()
 	}()
 
-	// Start alert monitoring
 	go func() {
 		alertChannel := detector.GetRuleEngineAlertChannel()
 		for {
 			select {
 			case alert := <-alertChannel:
-				fmt.Printf("\n🚨 ALERT: [%s] %s - %s\n", alert.Severity, alert.Type, alert.Message)
+				fmt.Printf("\nALERT: [%s] %s - %s\n", alert.Severity, alert.Type, alert.Message)
 				if alert.Stats != nil {
 					fmt.Printf("   📊 Stats: %d flows, %d connections, %.2f flow/sec\n",
 						alert.Stats.TotalFlows, alert.Stats.TotalConnections, alert.Stats.FlowRate)
@@ -188,20 +185,16 @@ func detectAnomaly(client *HubbleGRPCClient, namespace string) {
 		}
 	}()
 
-	fmt.Println("✅ Anomaly detection started!")
+	fmt.Println("Anomaly detection started!")
 	fmt.Println("📊 Monitoring flows and detecting anomalies...")
 	fmt.Println("")
 
 	// Stream flows with anomaly detection
 	if err := client.StreamFlowsWithDetection(ctx, namespace, detector); err != nil {
 		if err == context.Canceled {
-			fmt.Println("✅ Anomaly detection stopped")
+			fmt.Println("Anomaly detection stopped")
 		} else {
-			fmt.Printf("❌ Anomaly detection failed: %v\n", err)
+			fmt.Printf("Anomaly detection failed: %v\n", err)
 		}
 	}
 }
-
-// Legacy printAnomalyAlert function removed - alerts now handled by rule engine
-
-// printRedisStats function removed - not needed anymore

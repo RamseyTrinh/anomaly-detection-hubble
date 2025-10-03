@@ -63,7 +63,6 @@ type Alert struct {
 	Stats     *FlowStats `json:"stats,omitempty"`
 }
 
-// NewAnomalyDetector creates a new anomaly detector
 func NewAnomalyDetector(config *Config, logger *logrus.Logger) (*AnomalyDetector, error) {
 	// Initialize Redis-based flow cache
 	flowCache, err := NewFlowCache(logger)
@@ -90,7 +89,6 @@ func NewAnomalyDetector(config *Config, logger *logrus.Logger) (*AnomalyDetector
 	return ad, nil
 }
 
-// ProcessFlow processes a single flow and checks for anomalies
 func (ad *AnomalyDetector) ProcessFlow(ctx context.Context, f *Flow) {
 	ad.mu.Lock()
 	defer ad.mu.Unlock()
@@ -182,9 +180,6 @@ func (ad *AnomalyDetector) Close() error {
 	return nil
 }
 
-// GetRedisStats function removed - not needed anymore
-
-// GetRuleEngineStats returns rule engine statistics
 func (ad *AnomalyDetector) GetRuleEngineStats() map[string]interface{} {
 	if ad.ruleEngine == nil {
 		return nil
@@ -192,7 +187,6 @@ func (ad *AnomalyDetector) GetRuleEngineStats() map[string]interface{} {
 	return ad.ruleEngine.GetStats()
 }
 
-// GetRuleEngineAlertChannel returns the rule engine alert channel
 func (ad *AnomalyDetector) GetRuleEngineAlertChannel() <-chan Alert {
 	if ad.ruleEngine == nil {
 		return nil

@@ -100,13 +100,13 @@ func (c *HubbleGRPCClient) StreamFlows(ctx context.Context, namespace string) er
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Println("\n🛑 Stopped streaming flows")
+			fmt.Println("\nStopped streaming flows")
 			return nil
 		default:
 			// Receive flow from stream
 			response, err := stream.Recv()
 			if err == io.EOF {
-				fmt.Println("🛑 Stream ended")
+				fmt.Println("Stream ended")
 				return nil
 			}
 			if err != nil {

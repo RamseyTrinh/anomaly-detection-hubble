@@ -125,7 +125,6 @@ func (re *RuleEngine) Stop() {
 	close(re.alertChannel)
 }
 
-// periodicEvaluation runs rule evaluation periodically
 func (re *RuleEngine) periodicEvaluation() {
 	ticker := time.NewTicker(5 * time.Second) // Evaluate every 5 seconds (faster for testing)
 	defer ticker.Stop()
@@ -140,33 +139,28 @@ func (re *RuleEngine) periodicEvaluation() {
 	}
 }
 
-// evaluateAllRules evaluates all enabled rules
 func (re *RuleEngine) evaluateAllRules() {
 	re.mu.RLock()
 	defer re.mu.RUnlock()
 
-	// Get flow windows for status display
 	windows, err := re.flowCache.GetFlowWindows(60) // 60 second window
 	if err != nil {
 		re.logger.Errorf("Failed to get flow windows: %v", err)
 		return
 	}
 
-	// Calculate total requests across all windows
 	totalRequests := 0
 	for _, window := range windows {
 		totalRequests += window.Count
 	}
 
-	// Display status every 60 seconds
 	if time.Since(re.lastStatusLog) > 60*time.Second {
-		re.logger.Infof("📊 Status: %d total requests in last 60s - Normal", totalRequests)
+		re.logger.Infof("Status: %d total requests in last 60s - Normal", totalRequests)
 		re.lastStatusLog = time.Now()
 	}
 
-	// Hiển thị thông tin về baseline nếu cần
 	if len(windows) > 0 {
-		re.logger.Debugf("📈 Analyzing %d flow windows for anomaly detection", len(windows))
+		re.logger.Debugf("Analyzing %d flow windows for anomaly detection", len(windows))
 
 		// Debug: In chi tiết các flow windows
 		for i, window := range windows {
@@ -426,12 +420,10 @@ func (re *RuleEngine) processAlert(alert Alert) {
 	// like Slack, PagerDuty, email, etc.
 }
 
-// GetAlertChannel returns the alert channel for external consumption
 func (re *RuleEngine) GetAlertChannel() <-chan Alert {
 	return re.alertChannel
 }
 
-// GetStats returns rule engine statistics
 func (re *RuleEngine) GetStats() map[string]interface{} {
 	re.mu.RLock()
 	defer re.mu.RUnlock()
