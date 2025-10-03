@@ -95,13 +95,13 @@ func (c *HubbleGRPCClient) StreamFlows(ctx context.Context, namespace string, fl
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Println("\n🛑 Stopped streaming flows")
+			fmt.Println("\n Stopped streaming flows")
 			return nil
 		default:
 			// Receive flow from stream
 			response, err := stream.Recv()
 			if err == io.EOF {
-				fmt.Println("🛑 Stream ended")
+				fmt.Println(" Stream ended")
 				return nil
 			}
 			if err != nil {
@@ -114,7 +114,7 @@ func (c *HubbleGRPCClient) StreamFlows(ctx context.Context, namespace string, fl
 			flow := c.convertHubbleFlow(response.GetFlow())
 			if flow != nil && flowCache != nil {
 				flowCache.AddFlow(flow)
-				fmt.Printf("💾 Saved flow #%d to Redis\n", flowCount)
+				fmt.Printf("Saved flow #%d to Redis\n", flowCount)
 			}
 
 			// Also print flow details for viewing

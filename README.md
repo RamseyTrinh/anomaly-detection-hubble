@@ -146,7 +146,7 @@ Time Windows → Rule Engine → 4 Detection Rules
 Metrics Calculation → Threshold Check → Alert Generation
      ↓
 Status Display: "📊 Status: X requests - Normal"
-Alert Display: "🚨 [time] CRITICAL DDoS Attack Detected"
+Alert Display: " [time] CRITICAL DDoS Attack Detected"
 ```
 
 ## Các loại Alert
@@ -209,29 +209,7 @@ Alert Display: "🚨 [time] CRITICAL DDoS Attack Detected"
 📊 Status: 200 total requests in last 60s - Normal
 ```
 
-### DDoS Spike Alert
-```
-🚨 [2024-01-15 14:30:25] CRITICAL DDoS Attack Detected: 75 flows in 5s (threshold: 50) - demo-frontend-xxx:demo-api-yyy
-   📈 Stats: 75 flows, 15.00 flow/sec, 75 connections
-```
 
-### Service Down Alert
-```
-🚨 [2024-01-15 14:31:10] CRITICAL Service Down Detected: No traffic for 30s - demo-frontend-xxx:demo-api-yyy
-   📈 Stats: 0 flows, 0.00 flow/sec, 0 connections
-```
-
-### Port Scan Alert
-```
-🔴 [2024-01-15 14:32:05] HIGH Port Scan Detected: 25 unique ports in 30s (threshold: 20) - demo-frontend-xxx:demo-api-yyy
-   📈 Stats: 25 flows, 0.83 flow/sec, 25 connections
-```
-
-### Cross-Namespace Alert
-```
-🟡 [2024-01-15 14:33:00] MEDIUM Cross-Namespace Traffic Detected: demo-frontend-xxx (default) -> demo-api-yyy (kube-system) - flow:demo-frontend-xxx:demo-api-yyy
-   📈 Stats: 1 flows, 0.02 flow/sec, 1 connections
-```
 
 ### Status Display (Every 60 seconds)
 ```
@@ -308,14 +286,6 @@ docker run -it --rm hubble-anomaly-detector
 
 ## Changelog
 
-### v2.0.0 - Redesign Anomaly Detection Rules
-- 🎯 **4 Rules mới**: DDoS Spike, Traffic Drop, Port Scan, Cross-Namespace
-- 🗑️ **Xóa bucket logic**: Loại bỏ hoàn toàn bucket-based analysis
-- 🚀 **Đơn giản hóa**: Logic đơn giản hơn, ít false positive
-- 📊 **Status Display**: Hiển thị tổng số request và trạng thái "Normal" mỗi 5 giây
-- 🚨 **Alert Format**: Cải thiện format alert với timestamp, emoji severity và thông tin chi tiết
-- 🔧 **Code Cleanup**: Xóa tất cả functions liên quan đến bucket
-- 📝 **Documentation**: Cập nhật README.md với 4 rules mới
 
 ### v1.1.0 - Tối ưu hóa codebase
 - ✅ Loại bỏ các function không sử dụng

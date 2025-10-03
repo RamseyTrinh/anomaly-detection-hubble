@@ -77,34 +77,34 @@ func (re *RuleEngine) initializeDefaultRules() {
 	}
 
 	// 2. Traffic Drop Rule: 30s không có traffic
-	// re.rules["traffic_drop"] = &RuleConfig{
-	// 	Name:        "Traffic Drop",
-	// 	Enabled:     true,
-	// 	WindowSize:  30,  // 30 seconds
-	// 	Threshold:   0.0, // 0 flows (no traffic)
-	// 	Severity:    "CRITICAL",
-	// 	Description: "Detects service down - no traffic for 30 seconds",
-	// }
+	re.rules["traffic_drop"] = &RuleConfig{
+		Name:        "Traffic Drop",
+		Enabled:     true,
+		WindowSize:  30,  // 30 seconds
+		Threshold:   0.0, // 0 flows (no traffic)
+		Severity:    "CRITICAL",
+		Description: "Detects service down - no traffic for 30 seconds",
+	}
 
-	// // 3. Port Scan Rule: >20 unique ports trong 30s
-	// re.rules["port_scan"] = &RuleConfig{
-	// 	Name:        "Port Scan",
-	// 	Enabled:     true,
-	// 	WindowSize:  30,   // 30 seconds
-	// 	Threshold:   20.0, // 20 unique ports
-	// 	Severity:    "HIGH",
-	// 	Description: "Detects port scanning - >20 unique ports in 30 seconds",
-	// }
+	// 3. Port Scan Rule: >20 unique ports trong 30s
+	re.rules["port_scan"] = &RuleConfig{
+		Name:        "Port Scan",
+		Enabled:     true,
+		WindowSize:  30,   // 30 seconds
+		Threshold:   20.0, // 20 unique ports
+		Severity:    "HIGH",
+		Description: "Detects port scanning - >20 unique ports in 30 seconds",
+	}
 
-	// // 4. Cross-Namespace Rule: traffic sang namespace khác
-	// re.rules["cross_namespace"] = &RuleConfig{
-	// 	Name:        "Cross-Namespace",
-	// 	Enabled:     true,
-	// 	WindowSize:  60,  // 60 seconds
-	// 	Threshold:   1.0, // Any cross-namespace traffic
-	// 	Severity:    "MEDIUM",
-	// 	Description: "Detects cross-namespace traffic not in allow-list",
-	// }
+	// 4. Cross-Namespace Rule: traffic sang namespace khác
+	re.rules["cross_namespace"] = &RuleConfig{
+		Name:        "Cross-Namespace",
+		Enabled:     true,
+		WindowSize:  60,  // 60 seconds
+		Threshold:   1.0, // Any cross-namespace traffic
+		Severity:    "MEDIUM",
+		Description: "Detects cross-namespace traffic not in allow-list",
+	}
 }
 
 // Start begins the rule engine processing
@@ -162,7 +162,7 @@ func (re *RuleEngine) evaluateAllRules() {
 	}
 
 	if alertCount > 0 {
-		re.logger.Warnf("🚨 %d anomalies detected out of %d rules", alertCount, enabledCount)
+		re.logger.Warnf(" %d anomalies detected out of %d rules", alertCount, enabledCount)
 	}
 }
 
@@ -188,12 +188,12 @@ func (re *RuleEngine) runRuleDirect(ruleName string, config *RuleConfig) *RuleRe
 	switch ruleName {
 	case "ddos_spike":
 		result = re.checkDDoSSpikeDirect(config, result)
-	// case "traffic_drop":
-	// 	result = re.checkTrafficDropDirect(config, result)
-	// case "port_scan":
-	// 	result = re.checkPortScanDirect(config, result)
-	// case "cross_namespace":
-	// 	result = re.checkCrossNamespaceDirect(config, result)
+	case "traffic_drop":
+		result = re.checkTrafficDropDirect(config, result)
+	case "port_scan":
+		result = re.checkPortScanDirect(config, result)
+	case "cross_namespace":
+		result = re.checkCrossNamespaceDirect(config, result)
 	default:
 		re.logger.Warnf("Unknown rule: %s", ruleName)
 	}
@@ -220,12 +220,12 @@ func (re *RuleEngine) checkDDoSSpikeDirect(config *RuleConfig, result *RuleResul
 	// re.logger.Debugf("🔍 DDoS Detection: Found %d total flows in time window", totalFlows)
 
 	if int64(totalFlows) > int64(config.Threshold) {
-		re.logger.Warnf("🚨 DDoS Attack Detected: %d total flows in %ds (threshold: %.0f)",
-			totalFlows, config.WindowSize, config.Threshold)
+		re.logger.Warnf("🔴 DDoS Attack Detected: %d total flows in %ds",
+			totalFlows, config.WindowSize)
 		result.Triggered = true
 		result.Severity = config.Severity
-		result.Message = fmt.Sprintf("DDoS Attack Detected: %d total flows in %ds (threshold: %.0f)",
-			totalFlows, config.WindowSize, config.Threshold)
+		result.Message = fmt.Sprintf("DDoS Attack Detected: %d total flows in %ds",
+			totalFlows, config.WindowSize)
 		result.Details["total_flows"] = totalFlows
 		result.Details["window_duration"] = config.WindowSize
 		result.Details["threshold"] = config.Threshold
@@ -339,8 +339,8 @@ func (re *RuleEngine) checkPortScanDirect(config *RuleConfig, result *RuleResult
 		if uniquePortCount > int(config.Threshold) {
 			result.Triggered = true
 			result.Severity = config.Severity
-			result.Message = fmt.Sprintf("Port Scan Detected: %d unique ports from %s in %ds (threshold: %.0f)",
-				uniquePortCount, srcIP, config.WindowSize, config.Threshold)
+			result.Message = fmt.Sprintf("Port Scan Detected: %d unique ports from %s in %ds",
+				uniquePortCount, srcIP, config.WindowSize)
 
 			// Convert map to slice for details
 			var portList []string
@@ -461,7 +461,7 @@ func (re *RuleEngine) processAlert(alert Alert) {
 	severityEmoji := "⚠️"
 	switch alert.Severity {
 	case "CRITICAL":
-		severityEmoji = "🚨"
+		severityEmoji = "🔴"
 	case "HIGH":
 		severityEmoji = "🔴"
 	case "MEDIUM":
@@ -474,8 +474,6 @@ func (re *RuleEngine) processAlert(alert Alert) {
 	re.logger.Warnf("%s [%s] %s %s", severityEmoji, timestamp, alert.Severity, alert.Message)
 
 	if alert.Stats != nil {
-		re.logger.Warnf("   📈 Stats: %d flows, %.2f flow/sec, %d connections",
-			alert.Stats.TotalFlows, alert.Stats.FlowRate, alert.Stats.TotalConnections)
 	}
 
 	// Here you could integrate with external alerting systems
