@@ -117,21 +117,17 @@ func viewFlows(client *HubbleGRPCClient, namespace string) {
 	}
 }
 
-// detectAnomaly handles the anomaly detection functionality
 func detectAnomaly(client *HubbleGRPCClient, namespace string) {
-	fmt.Println("\nANOMALY DETECTION")
+	fmt.Println("\n ANOMALY DETECTION")
 	fmt.Println("Connecting to Redis and starting anomaly detection...")
 	fmt.Println("Press Ctrl+C to return to main menu")
 	fmt.Println("")
 
-	// Create logger
 	logger := logrus.New()
 	logger.SetLevel(logrus.DebugLevel)
 
-	// Create config
 	config := &Config{}
 
-	// Initialize anomaly detector with Redis
 	detector, err := NewAnomalyDetector(config, logger)
 	if err != nil {
 		fmt.Printf("Failed to initialize anomaly detector: %v\n", err)
@@ -143,7 +139,6 @@ func detectAnomaly(client *HubbleGRPCClient, namespace string) {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Start streaming flows with anomaly detection
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -168,7 +163,6 @@ func detectAnomaly(client *HubbleGRPCClient, namespace string) {
 		}
 	}()
 
-	// Start Redis stats monitoring
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -176,7 +170,6 @@ func detectAnomaly(client *HubbleGRPCClient, namespace string) {
 		for {
 			select {
 			case <-ticker.C:
-				// Redis stats removed - not needed anymore
 			case <-ctx.Done():
 				return
 			}
@@ -184,10 +177,9 @@ func detectAnomaly(client *HubbleGRPCClient, namespace string) {
 	}()
 
 	fmt.Println("Anomaly detection started!")
-	fmt.Println("📊 Monitoring flows and detecting anomalies...")
+	fmt.Println(" Monitoring flows and detecting anomalies...")
 	fmt.Println("")
 
-	// Start streaming flows to Redis (separate from detection)
 	go func() {
 		if err := client.StreamFlows(ctx, namespace, detector.GetFlowCache()); err != nil {
 			if err == context.Canceled {
@@ -198,7 +190,6 @@ func detectAnomaly(client *HubbleGRPCClient, namespace string) {
 		}
 	}()
 
-	// Wait for context to be cancelled
 	<-ctx.Done()
 	fmt.Println("Anomaly detection stopped")
 }
